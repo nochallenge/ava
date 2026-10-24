@@ -1,0 +1,17 @@
+[package]
+name = "ava_grad"
+version = "0.1.0"
+edition = "2021"
+description = "TESTING / DESIGN ONLY - tensors, reverse-mode autodiff, brain ops (kWTA, LIF scan) and AdamW for Ava, std only"
+
+[dependencies]
+
+# standalone: detached from any parent workspace on purpose
+[workspace]
+
+[profile.release]
+codegen-units = 1
+debug = false
+
+[profile.test]
+opt-level = 3

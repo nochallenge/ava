@@ -1,0 +1,14 @@
+# TESTING / DESIGN ONLY — ava_data: byte-level BPE tokenizer + streaming sharded token reader.
+# std only, no dependencies. Detached from any parent workspace on purpose.
+[package]
+name = "ava_data"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[profile.release]
+codegen-units = 1
+debug = false
+
+[workspace]

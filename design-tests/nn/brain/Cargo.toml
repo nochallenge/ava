@@ -1,0 +1,22 @@
+# TESTING / DESIGN ONLY — ava_brain: the three pre-registered models (T yardstick transformer,
+# S Ava spiking, H Ava hybrid), the training binary and validation bits-per-byte.
+# Path dependencies on ../grad and ../data only; no crates.io dependencies.
+[package]
+name = "ava_brain"
+version = "0.1.0"
+edition = "2021"
+description = "TESTING / DESIGN ONLY - T/S/H language models on ava_grad + ava_data, training binary, val BPB"
+
+[dependencies]
+ava_grad = { path = "../grad" }
+ava_data = { path = "../data" }
+
+# standalone: detached from any parent workspace on purpose
+[workspace]
+
+[profile.release]
+codegen-units = 1
+debug = false
+
+[profile.test]
+opt-level = 3

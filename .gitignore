@@ -1,0 +1,11 @@
+/target
+
+/data/
+/brain/
+design-tests/target/
+eng_sentences*
+replies.tsv
+triples.tsv
+/scratch/
+**/target/
+design-tests/nn/*/runs/

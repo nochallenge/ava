@@ -1,0 +1,21 @@
+hello
+how are you ?
+what are you ?
+do you store what you know in a weight matrix ?
+how do you learn without gradient descent ?
+what keyword makes a variable mutable in rust ?
+what does the question mark operator do in rust ?
+what is a lifetime in rust ?
+which paper introduced the transformer ?
+what is overfitting ?
+what is backpropagation ?
+what is 23 + 58 ?
+what is 7 * 8 ?
+what is 2 3 + 5 8 ?
+fn main() {
+let mut v = Vec::new();
+impl fmt::Display for Point {
+for (i, x) in v.iter().enumerate() {
+match self {
+the quantum flux capacitor is purple on tuesdays
+:q

@@ -1,0 +1,2 @@
+# Release files are published with SHA-256 sums: keep them byte-for-byte on every platform.
+release/** -text

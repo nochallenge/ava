@@ -1,0 +1,10 @@
+[package]
+name = "design-tests"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rustyline = "14"
+
+# detached from the parent ava package on purpose
+[workspace]

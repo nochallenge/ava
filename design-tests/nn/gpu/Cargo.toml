@@ -1,0 +1,22 @@
+# TESTING / DESIGN ONLY — ava_gpu: candle (CUDA) trainer for the Ava-S spiking language model.
+# Path dependency on ../data (BPE + shards); candle from crates.io. Detached from any parent workspace.
+[package]
+name = "ava_gpu"
+version = "0.1.0"
+edition = "2021"
+description = "TESTING / DESIGN ONLY - Ava-S on candle/CUDA: train_gpu + generate_gpu"
+
+[dependencies]
+ava_data = { path = "../data" }
+candle-core = { version = "0.11.0", features = ["cuda"] }
+candle-nn = { version = "0.11.0", features = ["cuda"] }
+# same version and features as candle-core selects; used only by mem_probe to read the CUDA pool's counters
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "cuda-version-from-build-system", "dynamic-linking"] }
+
+[workspace]
+
+[profile.release]
+opt-level = 3
+
+[profile.test]
+opt-level = 3
