@@ -29,6 +29,23 @@ three crates for the tokenizer and shards, the autodiff engine with the spiking 
 ops, and the T/S/H models (see [ARCHITECTURE.md](ARCHITECTURE.md)). The rest of this guide is
 the plan that brain follows; the *Status* notes below mark what is done.
 
+**As of v0.2 (late October 2026)** the trained brain runs on a GPU (`design-tests/nn/gpu`), and her
+design has a working memory. Each block has three parts:
+
+- spiking neurons;
+- fast synapses that follow the gated delta rule;
+- the k-winners-take-all sparse layer.
+
+Three pre-registered tests at 20 tokens per weight shaped her:
+
+- **v34:** plain spiking Ava loses ground to a transformer as both grow.
+- **v35:** the fast-weight memory beats the transformer at every size tried, but its lead shrinks with
+  size.
+- **v36:** adding softmax attention made her worse, so she has none.
+
+The open problem is the slope: her curve is still flatter than a transformer's. The README has the
+numbers; the release model is in `release/ava/`.
+
 | Faculty | What it stores | How it answers |
 |---|---|---|
 | Grammar (`blimp_open.rs`) | Counts of which word follows which 1-4 words, in hash maps | Witten-Bell backoff gives each sentence a probability |
@@ -268,10 +285,10 @@ These rules are why her numbers can be trusted. Keep them as she grows.
     any test set, and write down what was removed.
   - Her dialogue exam already shows the danger: about a quarter of its pairs were in her
     training text.
-- **Fresh test sets** (unopened during development, as of 2026-10-16):
+- **Fresh test sets** (unopened during development, as of 2026-10-27):
   - ARC-AGI-2 evaluation, ConceptARC MinimalTasks, the OpenBookQA test, CLAMS (English),
     PoSH-BENCH and Mini-ARC.
-  - **Spent** (already used for decisions): ARC-AGI-1 evaluation, the BLiMP test, the ConceptARC
-    corpus and Zorro.
+  - **Spent** (already used): ARC-AGI-1 evaluation, the BLiMP test, the ConceptARC corpus, Zorro,
+    the ARC test and the SciQ test (opened once in v37; Ava-QA's SciQ number is a disclosed second look).
 - **No hand-written knowledge.** No word lists, canned phrases or per-puzzle code. What she
   does should come from what she read or practised.

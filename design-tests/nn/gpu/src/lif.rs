@@ -182,3 +182,206 @@ fn launch_cfg(threads: usize) -> candle_core::cuda_backend::cudarc::driver::Laun
         shared_mem_bytes: 0,
     }
 }
+
+/// 0/1 kWTA mask of `u` [N, H] (no gradient): 1 where u >= the k-th largest value of its row. One CUDA
+/// block per row finds that value by radix select (`kwta_mask_rows` in lif.cu), instead of sorting every
+/// row; the mask is the same as model::kwta_mask_sorted gives.
+pub fn kwta_mask_fast(u: &Tensor, k: usize) -> Result<Tensor> {
+    u.detach().contiguous()?.apply_op1_no_bwd(&KwtaMask { k })
+}
+
+struct KwtaMask {
+    k: usize,
+}
+
+impl candle_core::CustomOp1 for KwtaMask {
+    fn name(&self) -> &'static str {
+        "kwta-mask"
+    }
+
+    fn cpu_fwd(&self, s: &CpuStorage, l: &Layout) -> Result<(CpuStorage, Shape)> {
+        let (n, h) = l.shape().dims2()?;
+        let u = cpu_slice(s, l)?;
+        let mut m = vec![0f32; n * h];
+        let mut row = vec![0f32; h];
+        for r in 0..n {
+            let x = &u[r * h..(r + 1) * h];
+            row.copy_from_slice(x);
+            row.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            let kth = row[self.k.min(h) - 1];
+            for (o, &v) in m[r * h..(r + 1) * h].iter_mut().zip(x) {
+                *o = if v - kth >= 0.0 { 1.0 } else { 0.0 };
+            }
+        }
+        Ok((CpuStorage::F32(m), l.shape().clone()))
+    }
+
+    fn cuda_fwd(&self, s: &candle_core::CudaStorage, l: &Layout) -> Result<(candle_core::CudaStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle_core::cuda_backend::WrapErr;
+        let (n, h) = l.shape().dims2()?;
+        if h > 12288 {
+            candle_core::bail!("kwta-mask: rows of {h} exceed the shared-memory limit");
+        }
+        let dev = s.device().clone();
+        let u = cuda_slice(s, l)?;
+        let out = unsafe { dev.alloc::<f32>(n * h)? };
+        let func = dev.get_or_load_custom_func("kwta_mask_rows", "ava_lif", PTX)?;
+        let (ni, hi, ki) = (n as i32, h as i32, self.k.min(h) as i32);
+        let mut lb = func.builder();
+        lb.arg(&u).arg(&out).arg(&ni).arg(&hi).arg(&ki);
+        let cfg = LaunchConfig { grid_dim: (n as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: (h * 4) as u32 };
+        unsafe { lb.launch(cfg) }.w()?;
+        Ok((candle_core::CudaStorage::wrap_cuda_slice(out, dev), l.shape().clone()))
+    }
+}
+
+/// Mean cross-entropy (nats) of `logits` [N, V] against `targets` [N] (u32; a target >= V counts as 0
+/// and gets no gradient, but still counts in the mean's N, as with candle's cross_entropy only if no
+/// such targets occur). One kernel per row forward (log-sum-exp and the target's logit) and one backward,
+/// instead of candle's chain of full-size [N, V] ops. Rounding differs from candle's in the last bits.
+pub fn cross_entropy_fused(logits: &Tensor, targets: &Tensor) -> Result<Tensor> {
+    let out = logits.contiguous()?.apply_op2(&targets.contiguous()?, CeFwd)?; // [N, 2] = (loss, lse)
+    out.narrow(1, 0, 1)?.mean_all()
+}
+
+fn u32_cpu<'a>(s: &'a CpuStorage, l: &Layout) -> Result<&'a [u32]> {
+    let v = s.as_slice::<u32>()?;
+    match l.contiguous_offsets() {
+        Some((a, b)) => Ok(&v[a..b]),
+        None => candle_core::bail!("cross-entropy: targets must be contiguous"),
+    }
+}
+
+struct CeFwd;
+
+impl CustomOp2 for CeFwd {
+    fn name(&self) -> &'static str {
+        "ce-fwd"
+    }
+
+    fn cpu_fwd(&self, s1: &CpuStorage, l1: &Layout, s2: &CpuStorage, l2: &Layout) -> Result<(CpuStorage, Shape)> {
+        let (n, v) = l1.shape().dims2()?;
+        let (x, tg) = (cpu_slice(s1, l1)?, u32_cpu(s2, l2)?);
+        let mut out = vec![0f32; 2 * n];
+        for r in 0..n {
+            let row = &x[r * v..(r + 1) * v];
+            let m = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let lse = m + row.iter().map(|&z| (z - m).exp()).sum::<f32>().ln();
+            let t = tg[r] as usize;
+            out[2 * r] = if t < v { lse - row[t] } else { 0.0 };
+            out[2 * r + 1] = lse;
+        }
+        Ok((CpuStorage::F32(out), Shape::from((n, 2))))
+    }
+
+    fn cuda_fwd(
+        &self,
+        s1: &candle_core::CudaStorage,
+        l1: &Layout,
+        s2: &candle_core::CudaStorage,
+        l2: &Layout,
+    ) -> Result<(candle_core::CudaStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle_core::cuda_backend::WrapErr;
+        let (n, v) = l1.shape().dims2()?;
+        let dev = s1.device().clone();
+        let x = cuda_slice(s1, l1)?;
+        let tg = match l2.contiguous_offsets() {
+            Some((a, b)) => s2.as_cuda_slice::<u32>()?.slice(a..b),
+            None => candle_core::bail!("cross-entropy: targets must be contiguous"),
+        };
+        let out = unsafe { dev.alloc::<f32>(2 * n)? };
+        let func = dev.get_or_load_custom_func("ce_fwd", "ava_lif", PTX)?;
+        let (ni, vi) = (n as i32, v as i32);
+        let mut lb = func.builder();
+        lb.arg(&x).arg(&tg).arg(&out).arg(&ni).arg(&vi);
+        let cfg = LaunchConfig { grid_dim: (n as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        unsafe { lb.launch(cfg) }.w()?;
+        Ok((candle_core::CudaStorage::wrap_cuda_slice(out, dev), Shape::from((n, 2))))
+    }
+
+    fn bwd(&self, logits: &Tensor, targets: &Tensor, res: &Tensor, grad_res: &Tensor) -> Result<(Option<Tensor>, Option<Tensor>)> {
+        let aux = Tensor::cat(&[&grad_res.narrow(1, 0, 1)?, &res.narrow(1, 1, 1)?], 1)?.contiguous()?;
+        let gx = logits.contiguous()?.apply_op3_no_bwd(&targets.contiguous()?, &aux, &CeBwd)?;
+        Ok((Some(gx), None))
+    }
+}
+
+struct CeBwd;
+
+impl CustomOp3 for CeBwd {
+    fn name(&self) -> &'static str {
+        "ce-bwd"
+    }
+
+    fn cpu_fwd(&self, s1: &CpuStorage, l1: &Layout, s2: &CpuStorage, l2: &Layout, s3: &CpuStorage, l3: &Layout) -> Result<(CpuStorage, Shape)> {
+        let (n, v) = l1.shape().dims2()?;
+        let (x, tg, aux) = (cpu_slice(s1, l1)?, u32_cpu(s2, l2)?, cpu_slice(s3, l3)?);
+        let mut gx = vec![0f32; n * v];
+        for r in 0..n {
+            let t = tg[r] as usize;
+            let (g, lse) = (if t < v { aux[2 * r] } else { 0.0 }, aux[2 * r + 1]);
+            for i in 0..v {
+                gx[r * v + i] = ((x[r * v + i] - lse).exp() - if i == t { 1.0 } else { 0.0 }) * g;
+            }
+        }
+        Ok((CpuStorage::F32(gx), l1.shape().clone()))
+    }
+
+    fn cuda_fwd(
+        &self,
+        s1: &candle_core::CudaStorage,
+        l1: &Layout,
+        s2: &candle_core::CudaStorage,
+        l2: &Layout,
+        s3: &candle_core::CudaStorage,
+        l3: &Layout,
+    ) -> Result<(candle_core::CudaStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle_core::cuda_backend::WrapErr;
+        let (n, v) = l1.shape().dims2()?;
+        let dev = s1.device().clone();
+        let x = cuda_slice(s1, l1)?;
+        let tg = match l2.contiguous_offsets() {
+            Some((a, b)) => s2.as_cuda_slice::<u32>()?.slice(a..b),
+            None => candle_core::bail!("cross-entropy: targets must be contiguous"),
+        };
+        let aux = cuda_slice(s3, l3)?;
+        let gx = unsafe { dev.alloc::<f32>(n * v)? };
+        let func = dev.get_or_load_custom_func("ce_bwd", "ava_lif", PTX)?;
+        let (ni, vi) = (n as i32, v as i32);
+        let mut lb = func.builder();
+        lb.arg(&x).arg(&tg).arg(&aux).arg(&gx).arg(&ni).arg(&vi);
+        let cfg = LaunchConfig { grid_dim: (n as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        unsafe { lb.launch(cfg) }.w()?;
+        Ok((candle_core::CudaStorage::wrap_cuda_slice(gx, dev), l1.shape().clone()))
+    }
+}
+
+// ---- raw entry points for the hand-written S backward (model::Model::loss_and_grads): no autograd
+
+/// Spikes of the fused LIF scan, untracked. `beta` is the leak in (0, 1) (already through the sigmoid).
+pub fn lif_fwd_raw(cur: &Tensor, beta: &Tensor) -> Result<Tensor> {
+    cur.contiguous()?.apply_op2_no_bwd(&beta.contiguous()?, &LifScan)
+}
+
+/// (dL/dcur [B, T, D], dL/dbeta [D]) of the fused LIF scan for the spike gradient `grad_s`.
+pub fn lif_bwd_raw(cur: &Tensor, beta: &Tensor, grad_s: &Tensor) -> Result<(Tensor, Tensor)> {
+    let (b, t, d) = cur.dims3()?;
+    let packed = cur.contiguous()?.apply_op3_no_bwd(&beta.contiguous()?, &grad_s.contiguous()?, &LifScanBwd)?;
+    Ok((packed.narrow(1, 0, t)?, packed.narrow(1, t, 1)?.reshape((b, d))?.sum(0)?))
+}
+
+/// Per row (loss, lse) of the fused cross-entropy, untracked: [N, 2].
+pub fn ce_fwd_raw(logits: &Tensor, targets: &Tensor) -> Result<Tensor> {
+    logits.contiguous()?.apply_op2_no_bwd(&targets.contiguous()?, &CeFwd)
+}
+
+/// dL/dlogits of the fused cross-entropy; aux [N, 2] = (dL/dloss_row, lse).
+pub fn ce_bwd_raw(logits: &Tensor, targets: &Tensor, aux: &Tensor) -> Result<Tensor> {
+    logits.contiguous()?.apply_op3_no_bwd(&targets.contiguous()?, &aux.contiguous()?, &CeBwd)
+}

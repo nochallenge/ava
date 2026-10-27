@@ -1,0 +1,2 @@
+model	init	data	d	layers	epochs	steps	lr	warmup	min_lr_frac	wd	clip	seed	batch_tokens	examples	answer_loss_tail	val_bpb	train_seconds	tokens_per_sec	replay_rows	replay_ctx	replay_weight
+D	model.safetensors	train.sft	384	8	2	640	0.001	50	0.1	0.1	1	1	16384	40089	2.549181	1.550227	95.29	136669.6	16	256	1

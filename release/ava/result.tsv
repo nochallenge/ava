@@ -1,0 +1,2 @@
+model	device	d	layers	ctx	batch	tokens	steps	steps_run	lr	warmup	min_lr_frac	wd	clip	seed	data_seed	eval_tokens	weights_total	weights_nonembed	train_loss_last50	val_loss_nats_per_token	val_bpb	val_tokens_scored	val_bytes	train_seconds	eval_seconds	tokens_per_sec
+D	cuda	384	8	256	32	387083520	47251	47251	0.001	200	0.1	0.1	1	1	1	1000000	19354176	17781312	3.143049	3.145600	1.487072	1000000	3051730	2662.38	7.11	145397.0

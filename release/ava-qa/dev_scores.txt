@@ -1,0 +1,12 @@
+== sciq-dev
+model: accuracy 57.3% (573/1000); per-token-mean scoring 57.9%; with "I don't know" (tau 1.3887, best on this set): right 413, wrong 220, abstained 367, right - wrong 193, share right among answers 65.2%
+scored in 0.8s
+== arc-easy-dev
+model: accuracy 43.9% (250/570); per-token-mean scoring 42.6%; with "I don't know" (tau 2.6296, best on this set): right 109, wrong 91, abstained 370, right - wrong 18, share right among answers 54.5%
+scored in 0.6s
+== arc-challenge-dev
+model: accuracy 19.1% (57/299); per-token-mean scoring 20.1%; with "I don't know" (tau inf, best on this set): right 0, wrong 0, abstained 299, right - wrong 0, share right among answers 0.0%
+scored in 0.5s
+== sciq-dev open book
+model: accuracy 65.4% (654/1000); per-token-mean scoring 65.8%; with "I don't know" (tau 1.0419, best on this set): right 553, wrong 204, abstained 243, right - wrong 349, share right among answers 73.1%
+scored in 2.7s

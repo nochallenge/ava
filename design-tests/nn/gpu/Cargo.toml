@@ -11,6 +11,10 @@ ava_data = { path = "../data" }
 candle-core = { version = "0.11.0", features = ["cuda"] }
 candle-nn = { version = "0.11.0", features = ["cuda"] }
 # same version and features as candle-core selects; used only by mem_probe to read the CUDA pool's counters
+# the bf16 element type candle already uses (already on disk with candle; pinned, no download)
+half = "=2.7.1"
+# v37: reads the question-answer datasets (JSON); already on disk as candle's safetensors dependency (pinned, no download)
+serde_json = "=1.0.154"
 cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "cuda-version-from-build-system", "dynamic-linking"] }
 
 [workspace]

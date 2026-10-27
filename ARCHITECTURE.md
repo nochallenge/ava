@@ -410,13 +410,19 @@ per byte that `train` reports for validation.
 
 ## 12. What is not here yet
 
-- No bf16, no gradient checkpointing, no data parallelism. The GPU crate (section 13) fuses the LIF scan but nothing else.
-- No stateful LIF for generation: each new token re-runs the window.
-- The engram memory, sleep, reward learning and the self-model exist only in the first-life
+Sections 1 to 13 describe the CPU engine and the GPU crate as they were at v0.1. Section 14 describes
+v0.2: Ava's design with the fast-weight memory, the hand-written GPU training steps and the fused kernels.
+bf16, stateful generation and resumable checkpoints now exist on the GPU. Still missing:
+
+- data parallelism across GPUs;
+- the new design on the CPU engine, which still has only T, S and H;
+- the engram memory, sleep, reward learning and the self-model, which exist only in the first-life
   programs under `design-tests/examples/`; SCALING.md, stages 6 to 8, describes how they go on
   top of the trained brain.
 
-## 13. The GPU crate (`nn/gpu`)
+## 13. The GPU crate (`nn/gpu`) at v0.1
+
+This section is kept as it was written for v0.1; section 14 lists what changed.
 
 `ava_gpu` is the Ava-S model written against [candle](https://github.com/huggingface/candle)
 0.11 (`candle-core`, `candle-nn` with the `cuda` feature; `cudarc` only for `mem_probe` to read
@@ -490,3 +496,121 @@ the GPU as well): loss at init ≈ ln 4096, finite non-zero gradients for every 
 decay set, 30 AdamW steps on one batch driving the loss from 8.3 to about 1.2, the LIF forward
 and backward identities, the fused LIF op against the unrolled reference, the kWTA mask, the schedule arithmetic, and three AdamW steps against
 the formula in f64.
+
+## 14. v0.2: Ava's design on the GPU
+
+### The models
+
+`src/model.rs` holds every design that was tested, picked by `--model`:
+
+| Kind | What it is | Status |
+|---|---|---|
+| `D` | **Ava**: spiking memory, then the gated delta-rule fast-weight memory, then the kWTA sparse MLP, in every block | the release design |
+| `S` | spiking memory and the kWTA sparse MLP (Ava-S, Ava-M, Ava-M2) | v0.1's design; loses ground to T (v34) |
+| `A` | `D`, with causal softmax attention instead of the fast weights in every fourth block counted back from the last | worse than D at both sizes tested (v36) |
+| `T` | the yardstick transformer: attention, GELU MLP, a learned position table | the yardstick |
+| `F`, `G`, `R` | the v35 steps toward `D`: Hebbian fast weights, then learned gates, then unit q/k with an output gate | kept for the record |
+
+The fast-weight block of `D` (one per block, `H = d / 32` heads of width 32; the README gives the
+equations) has these tensors: `b{i}.hebb.{norm, wq, wk, wv, wg, wo, wa, ba, wb, bb}`. The per-head
+offsets `logit γ_h`, with `γ_h = 1 − 2^−(5+h)`, are constants, not weights. `wa`, `ba`, `wb` and `bb`
+start at 0, so at initialisation each head forgets at exactly `γ_h` and writes with `b = 1`. The
+spiking memory and the MLP have the same tensors as in v0.1.
+
+### The training step
+
+For `S`, `T`, `D` and `A`, `Model::loss_and_grads_*` computes the loss and every gradient by hand,
+without candle's autograd. Each step saves what its backward needs and calls the kernels below. The
+matmuls take bf16 operands with f32 accumulation (cuBLAS `gemm_ex`); everything else is f32.
+`AVA_BF16=0` gives f32 matmuls and `AVA_MANUAL_DA=0` returns `D` and `A` to autograd.
+
+The kernels, all in `src/lif.cu` and wrapped in `src/fused.rs`:
+
+- **Spiking memory.** `lif_fwd` and `lif_bwd`, one thread per (row, channel) over the whole time loop,
+  as in v0.1, with bf16-writing variants.
+- **Fast-weight memory.**
+  - `hebb_fwd` runs the whole block after the input projection, one warp per (row, head). The
+    state `F` sits in registers, 32 floats per lane. The kernel does the unit q/k, the gates, the
+    delta-rule update, the read, the head norm and the silu gate. It saves `F` every 16 tokens.
+  - `hebb_bwd` walks the chunks from the last. It recomputes each chunk's states from its checkpoint
+    into a per-warp scratch (the same arithmetic, so the same values), then walks back through the
+    chunk. It prefetches the next token's inputs.
+  - The block's six input projections are one matmul against `[Wq | Wk | Wv | Wg | Wa | Wb]`.
+- **Sparse code.** `kwta_relu_rows` is a radix select of the k-th largest value per row, with the mask
+  and the ReLU in the same pass; a warp walks the histogram. `relu_mask_bwd` is its backward.
+- **RMSNorm.** `rms_fwd`, `rms_bwd_rows` and `rms_bwd_gain`.
+- **Attention** (`T` and `A`). Tensor-core kernels `attn_fwd_tc`, `attn_bwd_q_tc` and `attn_bwd_kv_tc`
+  (bf16 inputs, f32 softmax, a saved log-sum-exp), with scalar f32 versions kept for the tests.
+- **Loss and embedding.** `ce_fwd` and `ce_bwd` (fused cross-entropy), and `embed_bwd` (one block per
+  vocabulary row, so each row's sum runs in a fixed order).
+- **Optimiser.** `adamw_inplace` and `adamw_inplace_s` update each weight and its two moments in place,
+  in one launch per tensor. The `_s` form reads the clip scale from the device.
+
+**A loop that does not wait.** The gradient norm and the clip factor are computed on the device in
+f64, with the same IEEE operations the host used before. Losses and norms are copied back in one go at
+each log step, so the CPU prepares the next batch while the GPU works. `AVA_SYNC_LOOP=1` restores the
+old loop, which gives byte-identical weights.
+
+**Checkpoints.** Every 500 steps (`--ckpt-every`), `ckpt/` gets the weights, both AdamW moments and
+the step count, the data cursor and the settings line. `--resume` continues from it. Sixty straight
+steps and thirty steps plus a resumed thirty give identical losses.
+
+**Generation.** `Model::stream` and `Model::step` carry each block's membranes, last spikes and fast
+weights from token to token (A also keeps a key/value cache for its attention blocks). A token costs
+one position of work, and the state has a fixed size: `L · (2d + H · 1024)` numbers. Token-by-token
+logits match the full forward within 1e-3 (`fast_weight_carried_state_matches_the_full_forward`).
+
+### How the speed-ups were checked
+
+Every faster path was used only after passing the rule below, which was pre-registered for each
+round:
+
+- **Either** a full training run that matches the old path within 0.005 BPB, with every logged loss
+  (every 200th step) within 0.05;
+- **or** byte-identical weights after 100 steps (`cmp` of the two `model.safetensors`).
+
+The full-run checks:
+
+| Path | Check run | Old | New |
+|---|---|---|---|
+| bf16 matmuls (S and T) | S d128 L4 lr .004 | 2.0131 | 2.0102 |
+| bf16 matmuls (S and T) | T d128 L4 lr .004 | 1.9594 | 1.9602 |
+| Hand-written D/A step | A d128 L4 lr .004 | 1.882973 | 1.883378 |
+
+These were byte-identical:
+
+- checkpointed fast-weight states;
+- the prefetch;
+- in-place AdamW;
+- the loop without waits;
+- the warp kWTA select.
+
+Two attempts failed or gave nothing and were not used: TF32 with the GLA path (−0.0061 BPB), and an
+earlier kWTA rewrite.
+
+### Speed and memory at the release shape
+
+The release shape is d 384, L 8, ctx 256 and batch 32, on an RTX 4070 with the card to itself
+(`--bench-steps 40`, first step excluded):
+
+| Model | Tokens per second | Seconds per step |
+|---|---|---|
+| D (Ava) | 132,400 | 0.062 |
+| A | 142,600 | 0.057 |
+| S | 268,000 | 0.031 |
+
+Before the chunked checkpoints, Nsight Systems put the fast-weight backward at 32% of D's kernel time;
+after them, it was 22%. Matmuls take about 35%.
+
+### Tests
+
+`./build.sh test --release --test smoke`, with `AVA_GPU_TEST_CUDA=1` to run them on the GPU too.
+The 24 tests include:
+
+- every hand-written step against autograd in f32 (`hand_written_s_backward_matches_autograd`,
+  `hand_written_t_backward_matches_autograd`, `hand_written_da_step_matches_autograd`);
+- each fused kernel against the chain of standard ops it replaces;
+- the delta rule against its token-by-token recurrence, with repeated keys;
+- tensor-core attention against the f32 kernels;
+- carried-state generation against the full forward;
+- bf16 steps tracked against the f32 gradients.
