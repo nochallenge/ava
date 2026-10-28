@@ -1,7 +1,7 @@
 // TESTING / DESIGN ONLY — generate_gpu: sample text from a train_gpu checkpoint (model.safetensors).
 //
 // generate_gpu --model FILE [--arch D|S|A|T|F|G|R] --d D --layers L [--ctx 256] [--prompt TEXT] [--tokens 100]
-//              [--temperature 1.0] [--top-k 40] [--seed 1] [--cpu] [--bpe FILE] [--window] [--check] [--qa] [--chat]
+//              [--temperature 1.0] [--top-k 40] [--seed 1] [--cpu] [--bpe FILE] [--window] [--check] [--qa] [--chat] [--glance]
 //
 // Ava (every kind but T) keeps her LIF membranes and fast weights from token to token (`Model::step`;
 // A also keeps a key/value cache for its attention blocks): each new token costs one
@@ -14,17 +14,20 @@
 // v37: --qa asks her --prompt as a question in the format she was taught ("Question: ...\nAnswer:", see
 // ava_gpu::qa) and prints her answer, which ends at her EOS (or after --tokens tokens). --chat does the same for
 // every line typed on stdin; each question starts from a fresh memory.
+//
+// v39 --glance: a model D trained with the glance (vocab 4112). The prompt gets its length marks
+// (ava_data::numbers::insert_marks); she writes her own marks, which are not printed.
 
 use ava_data::bpe::{Bpe, EOS};
+use ava_data::numbers::{insert_marks, strip_marks};
 use ava_data::rng::SplitMix64;
-use ava_gpu::model::{Config, Kind, Model, VOCAB};
-use candle_core::{DType, Device, Tensor, D};
-use candle_nn::{VarBuilder, VarMap};
+use ava_gpu::model::{Kind, Model};
+use candle_core::{Device, Tensor, D};
 use std::io::Write;
 use std::path::PathBuf;
 
 const USAGE: &str = "usage: generate_gpu --model FILE [--arch D|S|A|T|F|G|R] --d D --layers L [--ctx 256] [--prompt TEXT] [--tokens 100]\n\
-    \x20               [--temperature 1.0] [--top-k 40] [--seed 1] [--cpu] [--bpe FILE] [--window] [--check] [--qa] [--chat]";
+    \x20               [--temperature 1.0] [--top-k 40] [--seed 1] [--cpu] [--bpe FILE] [--window] [--check] [--qa] [--chat] [--glance]";
 
 fn main() {
     if let Err(e) = run() {
@@ -42,7 +45,7 @@ fn run() -> Result<(), String> {
     let mut temperature = 1.0f32;
     let mut top_k = 40usize;
     let mut seed = 1u64;
-    let (mut cpu, mut window, mut check, mut qa, mut chat) = (false, false, false, false, false);
+    let (mut cpu, mut window, mut check, mut qa, mut chat, mut glance) = (false, false, false, false, false, false);
     let mut bpe_path = PathBuf::from(ava_gpu::DEFAULT_BPE);
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -51,12 +54,13 @@ fn run() -> Result<(), String> {
         if key == "-h" || key == "--help" {
             return Err(USAGE.into());
         }
-        if matches!(key, "--cpu" | "--window" | "--check" | "--qa" | "--chat") {
+        if matches!(key, "--cpu" | "--window" | "--check" | "--qa" | "--chat" | "--glance") {
             match key {
                 "--cpu" => cpu = true,
                 "--window" => window = true,
                 "--qa" => qa = true,
                 "--chat" => chat = true,
+                "--glance" => glance = true,
                 _ => check = true,
             }
             i += 1;
@@ -87,11 +91,7 @@ fn run() -> Result<(), String> {
 
     let dev = ava_gpu::device(cpu).map_err(|e| format!("device: {e}"))?;
     let bpe = Bpe::load(&bpe_path).map_err(|e| format!("bpe {}: {e}", bpe_path.display()))?;
-    let cfg = Config::with_kind(kind, VOCAB, d, layers, ctx);
-    let mut varmap = VarMap::new();
-    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
-    let model = Model::new(cfg, vb).map_err(|e| format!("model: {e}"))?;
-    varmap.load(&model_path).map_err(|e| format!("load {}: {e}", model_path.display()))?;
+    let (cfg, _varmap, model) = ava_gpu::ckpt::load_expect(&model_path, kind, ctx, d, layers, glance, &dev)?;
 
     if qa || chat {
         // v37: ask her a question in the format she was taught (qa::prompt_text); she answers until her EOS.
@@ -99,11 +99,14 @@ fn run() -> Result<(), String> {
             return Err("--qa and --chat use the carried state (an Ava kind, without --window)".into());
         }
         let mut rng = SplitMix64::new(seed);
-        let top_k = top_k.max(1).min(VOCAB);
+        let top_k = top_k.max(1).min(cfg.vocab);
         let mut ask = |q: &str| -> Result<String, String> {
             let e = |e: candle_core::Error| e.to_string();
             let mut ids = vec![EOS];
             ids.extend(bpe.encode(&ava_gpu::qa::prompt_text("", q)));
+            if glance {
+                ids = insert_marks(&ids);
+            }
             let mut st = model.stream().map_err(e)?;
             let mut next = None;
             for &t in &ids {
@@ -119,7 +122,7 @@ fn run() -> Result<(), String> {
                 out.push(pick);
                 next = model.step(&mut st, pick).map_err(e)?;
             }
-            Ok(bpe.decode(&out).trim().to_string())
+            Ok(bpe.decode(&strip_marks(&out)).trim().to_string())
         };
         if qa {
             println!("Question: {}\nAnswer: {}", prompt.trim(), ask(&prompt)?);
@@ -144,12 +147,15 @@ fn run() -> Result<(), String> {
     }
 
     let mut ids: Vec<u32> = if prompt.is_empty() { vec![EOS] } else { bpe.encode(&prompt) };
+    if glance {
+        ids = insert_marks(&ids);
+    }
     if ids.is_empty() {
         ids.push(EOS);
     }
     let prompt_len = ids.len();
     let mut rng = SplitMix64::new(seed);
-    let top_k = top_k.max(1).min(VOCAB);
+    let top_k = top_k.max(1).min(cfg.vocab);
     let e = |e: candle_core::Error| e.to_string();
     // S carries its LIF state from token to token; T (or --window) re-runs the last `ctx` tokens.
     let mut stream = if kind.is_ava() && !window { Some(model.stream().map_err(e)?) } else { None };
@@ -175,7 +181,7 @@ fn run() -> Result<(), String> {
         }
     }
     let secs = t0.elapsed().as_secs_f64();
-    let text = ids[prompt_len..].split(|&t| t == EOS).map(|seg| bpe.decode(seg)).collect::<Vec<_>>().join("
+    let text = ids[prompt_len..].split(|&t| t == EOS).map(|seg| bpe.decode(&strip_marks(seg))).collect::<Vec<_>>().join("
 ");
     println!("{prompt}{text}");
     eprintln!(

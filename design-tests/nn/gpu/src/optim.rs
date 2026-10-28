@@ -67,6 +67,13 @@ impl AdamW {
     /// Speed round 13b: grad_norm without the copy to the host: the same sums, then the same f64 sqrt, as an f64
     /// scalar on the device. None when there are no gradients.
     pub fn grad_norm_t(&self, grads: &GradStore) -> Result<Option<Tensor>> {
+        if crate::fast_path() && multi_opt_on() {
+            // v40: the same sums in three launches (fused::grad_norm_multi, bit for bit the ops below)
+            let gs: Vec<Tensor> = self.params.iter().filter_map(|p| grads.get(p.var.as_tensor()).cloned()).collect();
+            if !gs.is_empty() && gs.iter().all(|g| g.device().is_cuda() && g.dtype() == DType::F32) {
+                return Ok(Some(crate::fused::grad_norm_multi(&gs)?));
+            }
+        }
         let mut acc: Option<Tensor> = None;
         for p in &self.params {
             if let Some(g) = grads.get(p.var.as_tensor()) {
@@ -91,6 +98,28 @@ impl AdamW {
         let (b1, b2) = (self.beta1, self.beta2);
         let bc1 = 1.0 - b1.powi(self.t as i32);
         let bc2 = 1.0 - b2.powi(self.t as i32);
+        if multi_opt_on() {
+            // v40: every parameter in one launch (fused::adamw_multi: the same arithmetic per element)
+            let (mut ws, mut gs, mut ms, mut vs, mut sh) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for (i, p) in self.params.iter().enumerate() {
+                let Some(g) = grads.get(p.var.as_tensor()) else { continue };
+                ws.push(p.var.as_tensor().clone());
+                gs.push(g.detach());
+                ms.push(self.m[i].as_tensor().clone());
+                vs.push(self.v[i].as_tensor().clone());
+                sh.push(if p.decay { 1.0 - lr * self.weight_decay } else { 1.0 });
+            }
+            let sc = crate::fused::AdamWScalars {
+                grad_scale: f64::NAN,
+                b1,
+                b2,
+                eps: self.eps,
+                step_size: lr / bc1,
+                inv_sqrt_bc2: 1.0 / bc2.sqrt(),
+                shrink: f64::NAN, // per parameter, from `sh`
+            };
+            return crate::fused::adamw_multi(&ws, &gs, &ms, &vs, &sh, scale, &sc);
+        }
         for (i, p) in self.params.iter().enumerate() {
             let Some(g) = grads.get(p.var.as_tensor()) else { continue };
             let sc = crate::fused::AdamWScalars {
@@ -169,6 +198,13 @@ impl AdamW {
         self.t = t;
         Ok(())
     }
+}
+
+/// v40: grad_norm_t and step_t (CUDA fast path) in a few launches for all parameters (fused::grad_norm_multi,
+/// fused::adamw_multi), the same bits as one launch chain per parameter. AVA_MULTI_OPT=0 keeps the per-parameter ops.
+pub fn multi_opt_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("AVA_MULTI_OPT").is_ok_and(|v| v == "0"))
 }
 
 /// Clipping factor for a gradient norm: clip / (norm + 1e-6) when norm > clip, else 1.

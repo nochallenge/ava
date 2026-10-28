@@ -1,0 +1,82 @@
+model=D
+glance=1
+vocab=4112
+magnitude_code=1
+engram_block=4
+device=cuda
+d=384
+layers=8
+weights=19962048
+tokenizer=bpe.txt (sha256 b1ccf0b9...; length marks 4096..4111 added in code)
+start=v39 ava-num (Ava's recipe with the glance and number practice; 387083520 tokens; val_bpb=1.487710; sha256 d7c061dd...)
+
+[grow]
+init=v39 ava-num
+mix=usual text 70%, 337 PG-19 training books 25%, number practice 5% (180046754 tokens)
+tokens=108134400
+steps=13200
+ctx=2048
+batch=4
+long_ctx=8192
+long_from=0.75
+recall_every=2
+recall_rows=1
+qa=42140 question-answer pairs (SciQ, Dolly 15k, ARC, OpenBookQA training splits; dev and test stems removed)
+qa_batch_tokens=4096
+qa_epochs=2
+qa_weight=1.0
+lr=3e-4
+warmup=200
+min_lr_frac=0.1
+wd=0.1
+clip=1.0
+data_seed=41
+seed=1
+train_seconds=2040.20
+tokens_per_sec=58004.4 (GPU shared with a video player)
+val_bpb=1.494022
+
+[sleep]
+facts=150 made-up people (birth year, home town, job)
+sleep_steps=300
+sleep_rows=16
+cycles=4
+surprise_alpha=1.0
+replay_rows=8
+replay_ctx=256
+replay_weight=1.0
+anchor=100 (picked on dev from 0, 10, 100, 1000)
+fisher_batches=16
+lr=3e-4
+warmup=30
+min_lr_frac=0.1
+wd=0.1
+clip=1.0
+train_seconds=24.74
+val_bpb=1.509961
+
+[reward]
+items=18176 multiple-choice training questions (SciQ, ARC, OpenBookQA; dev and test slices removed)
+norm=byte (picked on dev)
+reward_steps=300
+items_per_step=16
+tau=0
+temp=1.0
+baseline_decay=0.9
+replay_rows=8
+replay_ctx=256
+replay_weight=1.0
+anchor=100
+fisher_batches=16
+lr=1e-4
+warmup=30
+min_lr_frac=0.1
+wd=0.1
+clip=1.0
+train_seconds=51.23
+val_bpb=1.510709
+
+[eval]
+eval_ctx=256
+eval_tokens=1000000
+tau_questions=0.2273 (per byte, picked on dev)

@@ -8,10 +8,12 @@ blocks has three parts:
   only what it got wrong;
 - **sparse codes**: in the wide layer, only one unit in eight may be active.
 
-She has **no attention and no position embedding**. A transformer remembers by looking back over every
-earlier token. Ava remembers by changing her own state: the membranes and fast synapses. Her whole
-memory of a text is a fixed-size state (about 408 KB at the release size), so every new token costs the
-same however long the text is.
+She has **no position embedding and almost no attention**: one attention read in one block, added in
+v0.3, which her own tests show she does not use. A transformer remembers by looking back over every
+earlier token. Ava remembers by changing her own state: the membranes and fast synapses. Her working
+memory of a text is a fixed-size state (about 408 KB at the release size), so every new token costs
+about the same however long the text is. And like a brain, she can **sleep**: she reads a day's new
+facts, sleeps on them for half a minute, and knows them afterwards.
 
 She is trained end to end by gradient descent through a surrogate gradient, on one consumer GPU, with
 hand-written CUDA kernels. Everything from the byte-level tokenizer to the training step is written in
@@ -22,9 +24,31 @@ She is a **tiny research model**. She does not rival any modern assistant and wi
 nonsense. What she offers is a different design, built so that every part of it can be scaled, and a
 method: every number below comes from a test that was written down before it ran.
 
-**What is in this release (v0.2)**
+**What is in this release (v0.3)**
 
-- **Ava**, the new release model (trained as run Ava-B): d = 384, 8 layers, 19,354,176 weights
+- **Ava 0.3**, one model that reads, counts, reads whole books, answers questions and sleeps
+  ([model card](release/ava-0.3/MODEL_CARD.md); weights on the
+  [v0.3.0 release page](https://github.com/nochallenge/ava/releases/tag/v0.3.0)). Each test was
+  pre-registered and run once on fresh data:
+  - **numbers: +18 points** over the same recipe without this version's training (60.5% vs 42.4%);
+    comparing numbers of different lengths 90.5% vs 46.5%. She sees how long a number is at a glance
+    before reading its digits, as people do;
+  - **sleep: 96.2% after vs 23.8% before** on questions about 150 new people she read about and then
+    slept on (chance 25%);
+  - **long books: her memory helps across 16,384 tokens** of unseen books (0.033 bits per byte better
+    than a memory cut every 256 tokens);
+  - **questions: 40.7% vs 33.0%** on 1,200 held-out science questions, 4 choices (SciQ 56.5%).
+
+  **Synaptic consolidation** keeps sleep from costing her reading: the weights her reading leans on are
+  held in place, so sleep cost +0.016 bits per byte instead of +0.046. Three tests failed and are
+  reported as such: the new attention read is unused, reward learning added nothing measurable, and
+  her reading (1.511) is slightly below v0.2's Ava (1.487).
+- **The v0.2 models stay**: Ava (the reading model, 1.487 bits per byte) and Ava-QA (SciQ 56.4%), in
+  `release/ava/` and `release/ava-qa/`.
+
+**What came in v0.2**
+
+- **Ava**, the v0.2 release model (trained as run Ava-B): d = 384, 8 layers, 19,354,176 weights
   (17,781,312 outside the embedding). She read 387M tokens (20 per weight) on one RTX 4070 in
   44 minutes, and scores **1.487 bits per byte** on held-out text. The two v0.1 models scored 1.872 and
   1.888. Her [model card](release/ava/MODEL_CARD.md), tokenizer and settings are in `release/ava/`;
@@ -183,17 +207,25 @@ at once, and start empty for each new text. Nothing is stored token by token. Th
 of matrices that the text keeps rewriting, so it can hold the gist of a long passage, not a verbatim
 copy.
 
-**(c) The engram memory** is her hippocampus. It was built in her first life
-(`design-tests/examples/compose.rs`; design note `design-tests/hippo/design.md`) and is not yet
-connected to the trained brain:
+**(c) Sleep** moves the day into the slow weights, as the hippocampus replays the day into the cortex
+during sleep. Since v0.3 this is part of the trained brain (`grow_gpu --phase sleep`):
 
-- every lesson is kept whole as one engram;
-- recall is by overlap with the cue, and the engrams compete;
-- sleep replays the day's lessons into long-term memory exactly once;
-- familiarity is measured and shown.
+- she re-reads the day's episodes, the most surprising ones more often;
+- she re-reads her ordinary text at the same time, as the brain replays old memories;
+- **synaptic consolidation** holds the important synapses in place. Before sleep, each weight's
+  importance to her reading is measured (its mean squared gradient over 16 batches of ordinary text,
+  as in EWC). After every sleep step, each weight is pulled back towards its value before sleep, in
+  proportion to that importance. One dial trades how much of the day she keeps against how much of
+  her reading she protects.
 
-The plan is to put it on top of the trained brain with learned keys, so that she recalls by meaning,
-and to use sleep replay to train the slow weights (SCALING.md, stages 6 and 7).
+After half a minute of sleep she answers 96% of questions about 150 new people (24% before, at chance).
+With the facts in front of her and no sleep, she is still at chance: she cannot yet look up something
+she has just read. v0.3 added an attention read (the engram, block 4) and recall practice for that,
+and it went unused (see Results).
+
+Her first life had a separate engram memory (`design-tests/examples/compose.rs`; design note
+`design-tests/hippo/design.md`), in which every lesson is kept whole, recalled by overlap with the
+cue, and replayed in sleep exactly once. It is not connected to the trained brain.
 
 ## How she scales up
 
@@ -266,9 +298,12 @@ These are analogies, and some are loose. The table says which.
 | k-winners-take-all in the wide layer | Lateral inhibition and the sparse codes of cortex | Fair. Real inhibition is done by neurons and is graded; hers is an exact top-k |
 | No position embedding: order lives in the dynamics | Brains have no position index; order is carried by activity and synapses | Fair |
 | Weights trained by backpropagation | Synaptic plasticity | Loose. The brain does not backpropagate, even if the outcome (distributed knowledge) is alike |
+| Sleep: the day's episodes re-read with ordinary text, the most surprising more often (v0.3) | Hippocampal replay into the cortex during sleep (complementary learning systems, McClelland et al. 1995) | Fair in function. Her sleep is extra training steps, not a separate state of the network |
+| The anchor: important weights pulled back to their value before sleep (v0.3) | Synaptic consolidation: synapses that matter become harder to change (Benna and Fusi 2016) | Fair in function. Importance is measured by gradients (as in EWC, Kirkpatrick et al. 2017) |
+| The glance: one mark for a number's length before its digits, and a learned code for each digit's place (v0.3) | Seeing a number's length and shape before reading it; a place-value sense | Loose. It is an input code; what each place means is learned |
 | Engram memory and sleep replay (first life) | Hippocampal episodes and consolidation during sleep | Fair in function, not in mechanism |
 | Abstaining under right-minus-wrong scoring (first life) | Metacognition, the feeling of knowing | Fair in function |
-| Softmax attention | Brains attend, but do not keep and search a copy of every past input | Tested in v36 (model A) and dropped: it did worse than the memory alone at both sizes tested |
+| Softmax attention | Brains attend, but do not keep and search a copy of every past input | Tested in v36 (model A) and dropped: it did worse than the memory alone at both sizes tested. v0.3 has one attention read for looking things up; it went unused |
 
 ## Results
 
@@ -276,7 +311,49 @@ All bits-per-byte (BPB) scores are on held-out validation text from her own corp
 Bits per byte does not depend on the tokenizer. Every comparison below was pre-registered with its
 pass rule, run once, and judged by the letter.
 
-### Ava, the release model
+### Ava 0.3: numbers, long books, sleep (v39–v41)
+
+One model, made in three steps on one RTX 4070:
+
+1. **v39:** Ava's recipe from scratch (387M tokens, 45 minutes) with the glance and 2% child-style number
+   practice in her text.
+2. **v41, grow:** 108M more tokens (34 minutes, sharing the GPU), made up of:
+   - her usual text 70%, 337 whole public-domain books (PG-19) 25%, number practice 5%;
+   - question-answer batches;
+   - recall practice;
+   - the last quarter at 8,192 tokens per window.
+3. **v41, sleep** on 150 made-up people with the anchor (25 seconds), then **reward** learning on
+   training questions (51 seconds).
+
+Each sealed test was pre-registered and opened once. Brackets are 95% bootstrap intervals.
+
+| Test | Result | Verdict |
+|---|---|---|
+| Numbers (842 fresh items) | 60.5% vs v39's 42.4%: **+18.1 [+12.9, +23.0]**. Comparing numbers of different lengths: 90.5% vs 46.5% | pass |
+| Long text (100 unseen books, 16,384 tokens each) | the full memory beats a memory cut every 256 tokens by **0.033 bits per byte [0.031, 0.035]** from token 4,096 on | pass |
+| Find a planted fact in a book (attention on − off) | +1.3 [−0.8, +3.3]; 27% (chance 25%) | fail |
+| Sleep (450 questions about 150 new people) | **96.2% after vs 23.8% before: +72.4 [+68.2, +76.7]** | pass |
+| Questions (1,200 held-out SciQ, ARC, OBQA; 4 choices) | **40.7% vs v39's 33.0%: +7.7 [+4.9, +10.3]**; SciQ 56.5%, ARC 34.8%, OBQA 30.8% | pass |
+| Right − wrong, after reward vs before | −0.013 [−0.036, +0.011] | fail |
+| Reading (val bits per byte, rule ≤ 1.497) | 1.511 | fail (narrowly) |
+
+BLiMP: 74.1%.
+
+**What it means.**
+
+- **The anchor works.** On dev, sleep without it cost her reading +0.046 BPB; with it, +0.016, for 5
+  points less recall of the day.
+- **Scoring answers per byte** instead of in total put OpenBookQA back above chance.
+- **Numbers improved through practice, not the sense-of-size code.** Switching that code off changes
+  0.3 points; switching the place code off costs 8.
+- **Attention went unused twice** (v40 and v41). Her fast-weight memory already covers short gaps, and
+  the read was added late with its output at zero. The next tries are to train lookups from the start,
+  or to make the fast-weight memory itself last longer.
+
+The 1,200 questions are held-out slices of the training splits, because the official test splits were
+spent by earlier versions. Full card: [release/ava-0.3/MODEL_CARD.md](release/ava-0.3/MODEL_CARD.md).
+
+### Ava (v0.2), the reading model
 
 | | |
 |---|---|
@@ -444,8 +521,21 @@ cd design-tests/nn/gpu
 cd ../../..
 ```
 
-**Get the weights** from the [v0.2.0 release page](https://github.com/nochallenge/ava/releases/tag/v0.2.0)
-(from the repository root):
+**Get Ava 0.3** from the [v0.3.0 release page](https://github.com/nochallenge/ava/releases/tag/v0.3.0)
+and run her (from the repository root):
+
+```
+curl -L -o release/ava-0.3/model.safetensors https://github.com/nochallenge/ava/releases/download/v0.3.0/ava-0.3.safetensors
+(cd release/ava-0.3 && sha256sum -c SHA256SUMS)
+design-tests/nn/gpu/target/release/generate_gpu --model release/ava-0.3/model.safetensors \
+  --bpe release/ava-0.3/bpe.txt --arch D --d 384 --layers 8 --glance \
+  --prompt "I have 3 apples and 4 more, so now I have" --tokens 40 --temperature 0.8 --seed 1
+```
+
+`--glance` adds the number-length marks she reads. To teach her new facts in her sleep, see
+`grow_gpu --phase sleep` in her [model card](release/ava-0.3/MODEL_CARD.md).
+
+**Get the v0.2 models** from the [v0.2.0 release page](https://github.com/nochallenge/ava/releases/tag/v0.2.0):
 
 ```
 curl -L -o release/ava/model.safetensors https://github.com/nochallenge/ava/releases/download/v0.2.0/ava.safetensors
@@ -568,6 +658,8 @@ yourself and place them under `data/`, which git ignores:
 | `blimp/`, `zorro/`, `clams-en/`, `posh-bench/` | grammar test sets | see the file headers in `design-tests/examples/` |
 | `arc-agi-1/`, `arc-agi-2/`, `conceptarc/`, `mini-arc/` | ARC puzzle sets | github.com/fchollet/ARC-AGI and related repositories |
 | `openbookqa/` | OpenBookQA, V1 Sep 2018 | Allen Institute for AI |
+| `qa/` | SciQ, Dolly 15k and ARC, for teaching answers (`qa_prep`) | Allen Institute for AI; Databricks |
+| `pg19/` | PG-19 public-domain books (v0.3 read 337 from its training split) | DeepMind (Apache 2.0) |
 | `nn/` | the BPE file and shards made by the commands above | built locally |
 
 ## Repository layout
@@ -576,8 +668,10 @@ yourself and place them under `data/`, which git ignores:
 design-tests/nn/gpu/      ava_gpu    Ava on candle/CUDA: the models (D = Ava, S, A, T and the v35
                                      variants), hand-written training steps, CUDA kernels (lif.cu),
                                      train_gpu, generate_gpu, blimp_gpu; qa_prep, sft_gpu, qa_eval
-                                     for teaching and scoring answers (see build.sh)
-design-tests/nn/data/     ava_data   byte-level BPE, AVATOK01 shards, streaming sampler, cursor
+                                     for teaching and scoring answers; grow_gpu (grow, sleep with
+                                     the anchor, reward); mc_eval, num_eval, long_eval (v0.3 tests)
+design-tests/nn/data/     ava_data   byte-level BPE, AVATOK01 shards, streaming sampler, cursor;
+                                     number marks and practice, books, recall and sleep-fact items
 design-tests/nn/grad/     ava_grad   CPU tensors, autodiff tape, LIF scan, kWTA, AdamW, AVAWTS01 checkpoints
 design-tests/nn/brain/    ava_brain  the CPU models (T / S / H), trainer, bits per byte;
                                      train, generate, talk, score, profile
@@ -587,7 +681,8 @@ design-tests/examples/    one program per first-life faculty: compose.rs (talk, 
                           procedure.rs (arithmetic as habits), know_what.rs (the self-model that
                           abstains), exam.rs, blimp_open.rs, read_think.rs, paired_boot.rs
 design-tests/hippo/       the hippocampus design note
-release/ava/              the release model: tokenizer, settings, model card (weights: release page)
+release/ava-0.3/          Ava 0.3: tokenizer, settings, model card (weights: release page)
+release/ava/              v0.2's reading model: the same
 release/ava-qa/           Ava taught to answer questions: the same, for Ava-QA
 release/ava-s/, ava-m/    the v0.1 models
 ARCHITECTURE.md           the technical deep-dive (CPU engine and v0.1 GPU crate)
@@ -619,9 +714,9 @@ The top-level `src/` is a hello-world placeholder from the project's first day.
 
 ## Limits
 
-- She is tiny: 19 million weights. Modern language models have thousands of times more.
-- She has read little: 387M tokens of a small, dialogue-heavy English corpus. She knows no other
-  language and very little of the world.
+- She is tiny: about 20 million weights. Modern language models have thousands of times more.
+- She has read little: about 495M tokens (Ava 0.3) of a small, dialogue-heavy English corpus and 337
+  old books. She knows no other language and very little of the world.
 - Her curve is flatter than a transformer's. At her size, the transformer's fitted line is 0.038
   BPB ahead of her; the line crosses hers at about 5M weights. Steepening the curve is the main open
   problem (see the roadmap).
@@ -629,7 +724,10 @@ The top-level `src/` is a hello-world placeholder from the project's first day.
   ARC Challenge questions are still beyond her. There is no conversation format and no safety tuning.
 - She will produce nonsense often, repeat herself, and make things up. Do not rely on anything she
   says.
-- Trained on one GPU at context 256. Her memory runs on longer texts, but they are not yet tested.
+- Her memory helps across 16,384 tokens of a book (v0.3), but she cannot yet look up a fact she has
+  just read: with it in front of her she answers at chance, and the attention read added for this is
+  unused. She learns new facts by sleeping on them.
+- Reward learning (learning from right and wrong alone) added nothing measurable in v0.3.
 - She trains slower than a transformer of her size in this code. On an RTX 4070 at d 384 and 8 layers, with
   8,192 tokens per step:
   - at context 256: 148,000 tokens per second, against the transformer's 268,000;
@@ -644,8 +742,8 @@ The top-level `src/` is a hello-world placeholder from the project's first day.
   grows by about 24 KB with every token.
 - The GPU trainer is not bit-reproducible (CUDA reductions vary in the last bits) and has been
   tested on one card (RTX 4070, compute capability 8.9) and on Windows only.
-- The first-life faculties (abstention, engram memory, arithmetic habits) are not yet connected to
-  the trained brain.
+- Sleep is now part of the trained brain (v0.3). The other first-life faculties (the engram memory,
+  arithmetic habits) are not yet connected to it; abstention is, through Ava-QA's "I don't know".
 
 ## Roadmap
 
@@ -662,13 +760,16 @@ The top-level `src/` is a hello-world placeholder from the project's first day.
    - a leaner rest of the block at short contexts.
 3. **Many GPUs.** Data parallelism, so anyone with a cluster can run the scaling test far beyond this
    PC.
-4. **Answering questions.** Begun in v0.2: Ava-QA, taught on question-and-answer data with replay
-   and a calibrated "I don't know", scored right minus wrong. Next: harder questions (ARC Challenge),
-   longer answers, and reading numbers the way the brain does (a sense of size, not only digits).
-5. **Hippocampus.** Replay while learning is in (v0.2). Still to come: the engram memory with learned
-   keys on top of the trained brain, and sleep that writes episodes into the slow weights.
-6. **Reward learning.** Learning from right and wrong alone, as her arithmetic habits do.
-7. **Long texts.** Test her fixed-size memory on texts far longer than her training context.
+4. **Answering questions.** Ava-QA (v0.2) and Ava 0.3 answer multiple-choice science questions with
+   a calibrated "I don't know". Next: harder questions (ARC Challenge) and longer answers.
+5. **Hippocampus.** Replay (v0.2) and sleep with synaptic consolidation (v0.3) are in. Next: looking
+   things up in what she has just read. Attention added late went unused twice. Next tries: train
+   lookups from the start, or make the fast-weight memory itself last longer.
+6. **A diary.** Keep every conversation, sleep on each day, learn from corrections, and measure her
+   growth over time. A diary stays private: public weights are trained without one.
+7. **Numbers.** The glance and practice are in (v0.3). A learned sense of size is in her weights but
+   unused.
+8. **Reward learning.** Learning from right and wrong alone. Tried in v0.3; no measurable gain yet.
 
 ## Licence
 

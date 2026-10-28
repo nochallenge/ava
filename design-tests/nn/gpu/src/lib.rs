@@ -14,6 +14,11 @@
 pub mod eval;
 pub mod fused;
 pub mod lif;
+pub mod mag;
+pub mod anchor;
+pub mod ckpt;
+pub mod dist;
+pub mod mc;
 pub mod model;
 pub mod optim;
 pub mod qa;

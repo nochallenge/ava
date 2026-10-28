@@ -13,3 +13,6 @@ design-tests/nn/*/runs/
 # v0.2 on: model weights are release-page downloads, not in git
 release/ava/model.safetensors
 release/ava-qa/model.safetensors
+**/target-*/
+design-tests/nn/gpu-fast/
+release/ava-0.3/model.safetensors

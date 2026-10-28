@@ -22,6 +22,107 @@ pub fn byte_lengths(bpe: &Bpe) -> Vec<u32> {
         .collect()
 }
 
+/// v39: byte_lengths for a vocabulary of `vocab` ids. Ids the tokenizer does not have (the glance's length marks,
+/// 4096..4111) are 0 bytes: their loss counts against BPB without adding bytes.
+pub fn byte_lengths_n(bpe: &Bpe, vocab: usize) -> Vec<u32> {
+    let mut v = byte_lengths(bpe);
+    if vocab > v.len() {
+        v.resize(vocab, 0);
+    }
+    v
+}
+
+/// Total NLL (nats) of each sequence's tokens after the first (moved from blimp_gpu in v39, unchanged): batches of
+/// `batch` sequences sorted by length, right-padded with PAD; PAD targets are not scored. Every model here is
+/// causal, so padding after a sequence cannot change its scores.
+pub fn seq_nll(model: &Model, dev: &Device, seqs: &[Vec<u32>], batch: usize) -> Result<Vec<f64>> {
+    let mut out = vec![0.0f64; seqs.len()];
+    let mut order: Vec<usize> = (0..seqs.len()).collect();
+    order.sort_by_key(|&i| seqs[i].len());
+    for chunk in order.chunks(batch.max(1)) {
+        let t = chunk.iter().map(|&i| seqs[i].len()).max().unwrap_or(2).saturating_sub(1).max(1);
+        let b = chunk.len();
+        let (mut ids, mut tg, mut keep) = (Vec::with_capacity(b * t), Vec::with_capacity(b * t), Vec::with_capacity(b * t));
+        for &i in chunk {
+            let s = &seqs[i];
+            for p in 0..t {
+                let real = p + 1 < s.len();
+                ids.push(if real { s[p] } else { PAD });
+                tg.push(if real { s[p + 1] } else { 0 });
+                keep.push(if real { 1f32 } else { 0f32 });
+            }
+        }
+        let logits = model.forward(&Tensor::from_vec(ids, (b, t), dev)?)?; // [b·t, V]
+        let lp = candle_nn::ops::log_softmax(&logits, D::Minus1)?;
+        let picked = lp.gather(&Tensor::from_vec(tg, (b * t, 1), dev)?, 1)?.squeeze(1)?;
+        let nll: Vec<f32> = picked.neg()?.mul(&Tensor::from_vec(keep, b * t, dev)?)?.reshape((b, t))?.sum(1)?.to_vec1()?;
+        for (r, &i) in chunk.iter().enumerate() {
+            out[i] = nll[r] as f64;
+        }
+    }
+    Ok(out)
+}
+
+/// v39: paired bootstrap of the accuracy difference a − b over the same items (qa_eval's procedure): returns the
+/// mean difference and the 95% interval from `resamples` resamples drawn with SplitMix64(`seed`).
+pub fn paired_bootstrap(a: &[bool], b: &[bool], resamples: usize, seed: u64) -> (f64, f64, f64) {
+    let n = a.len().min(b.len());
+    if n == 0 || resamples == 0 {
+        return (0.0, 0.0, 0.0);
+    }
+    let diff: Vec<f64> = (0..n).map(|k| a[k] as i32 as f64 - b[k] as i32 as f64).collect();
+    let mean = diff.iter().sum::<f64>() / n as f64;
+    let mut rng = ava_data::rng::SplitMix64::new(seed);
+    let mut bs: Vec<f64> = (0..resamples)
+        .map(|_| {
+            let mut s = 0.0;
+            for _ in 0..n {
+                s += diff[rng.below(n as u64) as usize];
+            }
+            s / n as f64
+        })
+        .collect();
+    bs.sort_by(f64::total_cmp);
+    let lo = (resamples as f64 * 0.025) as usize;
+    let hi = ((resamples as f64 * 0.975) as usize).saturating_sub(1);
+    (mean, bs[lo.min(resamples - 1)], bs[hi.min(resamples - 1)])
+}
+
+/// The paired bootstrap for a score that weights groups equally (v39: the six kinds of the number test). Each
+/// resample redraws every group's items with replacement, inside that group, and averages the groups' mean
+/// differences (a − b). Returns (mean, 2.5% point, 97.5% point), the same order statistics as `paired_bootstrap`.
+pub fn stratified_paired_bootstrap(groups: &[(Vec<bool>, Vec<bool>)], resamples: usize, seed: u64) -> (f64, f64, f64) {
+    let diffs: Vec<Vec<f64>> = groups
+        .iter()
+        .map(|(a, b)| (0..a.len().min(b.len())).map(|k| a[k] as i32 as f64 - b[k] as i32 as f64).collect::<Vec<f64>>())
+        .filter(|d| !d.is_empty())
+        .collect();
+    if diffs.is_empty() || resamples == 0 {
+        return (0.0, 0.0, 0.0);
+    }
+    let g = diffs.len() as f64;
+    let mean = diffs.iter().map(|d| d.iter().sum::<f64>() / d.len() as f64).sum::<f64>() / g;
+    let mut rng = ava_data::rng::SplitMix64::new(seed);
+    let mut bs: Vec<f64> = (0..resamples)
+        .map(|_| {
+            let mut s = 0.0;
+            for d in &diffs {
+                let n = d.len();
+                let mut t = 0.0;
+                for _ in 0..n {
+                    t += d[rng.below(n as u64) as usize];
+                }
+                s += t / n as f64;
+            }
+            s / g
+        })
+        .collect();
+    bs.sort_by(f64::total_cmp);
+    let lo = (resamples as f64 * 0.025) as usize;
+    let hi = ((resamples as f64 * 0.975) as usize).saturating_sub(1);
+    (mean, bs[lo.min(resamples - 1)], bs[hi.min(resamples - 1)])
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BpbAcc {
     pub nats: f64,

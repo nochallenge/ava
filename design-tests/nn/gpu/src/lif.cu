@@ -19,6 +19,42 @@ __device__ __forceinline__ unsigned short f2bf(float f) {
 __device__ __forceinline__ void put(float* p, size_t i, float v) { p[i] = v; }
 __device__ __forceinline__ void put(unsigned short* p, size_t i, float v) { p[i] = f2bf(v); }
 
+// v40: the scans are latency-bound (one thread per neuron runs T dependent steps; at ctx 2048 x batch 4 only 1,536
+// threads exist), so the inputs of the next LIF_G steps are loaded while this group is worked on (indices clamped to
+// the last step, so the loads need no branches): the loads are always in flight and the time per step is the
+// arithmetic's own chain. The arithmetic is unchanged, step for step; emit(t, v, s) receives every step.
+#define LIF_G 32
+template <typename F>
+__device__ __forceinline__ void lif_scan_fwd(const float* __restrict__ x, int T, int D, float bt, float theta, F emit) {
+    float v = 0.0f, sp = 0.0f;
+    const int tl = T - 1;
+    float xa[LIF_G];
+#pragma unroll
+    for (int u = 0; u < LIF_G; ++u) xa[u] = x[(size_t)min(u, tl) * D];
+    int t0 = 0;
+    for (; t0 + LIF_G <= T; t0 += LIF_G) {
+        float xb[LIF_G];
+#pragma unroll
+        for (int u = 0; u < LIF_G; ++u) xb[u] = x[(size_t)min(t0 + LIF_G + u, tl) * D];
+#pragma unroll
+        for (int u = 0; u < LIF_G; ++u) {
+            v = __fsub_rn(__fadd_rn(__fmul_rn(bt, v), xa[u]), __fmul_rn(theta, sp));
+            sp = __fsub_rn(v, theta) >= 0.0f ? 1.0f : 0.0f;
+            emit(t0 + u, v, sp);
+        }
+#pragma unroll
+        for (int u = 0; u < LIF_G; ++u) xa[u] = xb[u];
+    }
+#pragma unroll
+    for (int u = 0; u < LIF_G; ++u) {
+        if (t0 + u < T) {
+            v = __fsub_rn(__fadd_rn(__fmul_rn(bt, v), xa[u]), __fmul_rn(theta, sp));
+            sp = __fsub_rn(v, theta) >= 0.0f ? 1.0f : 0.0f;
+            emit(t0 + u, v, sp);
+        }
+    }
+}
+
 template <typename O>
 __device__ __forceinline__ void lif_fwd_impl(const float* __restrict__ cur, const float* __restrict__ beta, O* __restrict__ s,
                                              int B, int T, int D, float theta) {
@@ -28,13 +64,7 @@ __device__ __forceinline__ void lif_fwd_impl(const float* __restrict__ cur, cons
     const float bt = beta[c];
     const float* x = cur + (size_t)b * T * D + c;
     O* o = s + (size_t)b * T * D + c;
-    float v = 0.0f, sp = 0.0f;
-    for (int t = 0; t < T; ++t) {
-        v = __fsub_rn(__fadd_rn(__fmul_rn(bt, v), x[(size_t)t * D]), __fmul_rn(theta, sp));
-        float st = __fsub_rn(v, theta) >= 0.0f ? 1.0f : 0.0f;
-        put(o, (size_t)t * D, st);
-        sp = st;
-    }
+    lif_scan_fwd(x, T, D, bt, theta, [&](int t, float, float st) { put(o, (size_t)t * D, st); });
 }
 extern "C" __global__ void lif_fwd(const float* __restrict__ cur, const float* __restrict__ beta, float* __restrict__ s, int B,
                                    int T, int D, float theta) {
@@ -641,20 +671,58 @@ extern "C" __global__ void lif_bwd_b(const float* __restrict__ cur, const float*
     const float* g = gs + (size_t)b * T * D + c;
     float* o = scratch + (size_t)b * (T + 1) * D + c;
     unsigned short* ob = gb + (size_t)b * T * D + c;
-    float v = 0.0f, sp = 0.0f;
-    for (int t = 0; t < T; ++t) {
-        v = __fsub_rn(__fadd_rn(__fmul_rn(bt, v), x[(size_t)t * D]), __fmul_rn(theta, sp));
-        sp = __fsub_rn(v, theta) >= 0.0f ? 1.0f : 0.0f;
-        o[(size_t)t * D] = v;
-    }
+    // v40: both passes keep the next LIF_G steps' inputs in flight (see lif_scan_fwd); the reverse pass works out a
+    // group's quotients (independent of the recurrence) before its chain. The same operations as v39, with the
+    // contractions nvcc chose there spelled out: a = fma(|v - theta|, slope, 1), gv = fma(beta, gv', gs / (a a)),
+    // gbeta = fma(gv, v_{t-1}, gbeta), in the same order.
+    lif_scan_fwd(x, T, D, bt, theta, [&](int t, float v, float) { o[(size_t)t * D] = v; });
     float gv_next = 0.0f, gbeta = 0.0f;
-    for (int t = T - 1; t >= 0; --t) {
-        float vt = o[(size_t)t * D];
-        float a = 1.0f + slope * fabsf(vt - theta);
-        float gv = g[(size_t)t * D] / (a * a) + bt * gv_next;
-        if (t > 0) gbeta += gv * o[(size_t)(t - 1) * D];
-        ob[(size_t)t * D] = f2bf(gv);
-        gv_next = gv;
+    // the group from t1 down: va[u] = v_{t1-u}, ga[u] = gs_{t1-u} (indices clamped at 0); vb, gn: the next group's
+    float va[LIF_G], ga[LIF_G];
+#pragma unroll
+    for (int u = 0; u < LIF_G; ++u) {
+        const size_t t = (size_t)max(T - 1 - u, 0);
+        va[u] = o[t * D];
+        ga[u] = g[t * D];
+    }
+    int t1 = T - 1;
+    for (; t1 + 1 >= LIF_G; t1 -= LIF_G) {
+        float vb[LIF_G], gn[LIF_G], q[LIF_G];
+#pragma unroll
+        for (int u = 0; u < LIF_G; ++u) {
+            const size_t t = (size_t)max(t1 - LIF_G - u, 0);
+            vb[u] = o[t * D];
+            gn[u] = g[t * D];
+        }
+#pragma unroll
+        for (int u = 0; u < LIF_G; ++u) {
+            const float a = __fmaf_rn(fabsf(__fsub_rn(va[u], theta)), slope, 1.0f);
+            q[u] = __fdiv_rn(ga[u], __fmul_rn(a, a));
+        }
+#pragma unroll
+        for (int u = 0; u < LIF_G; ++u) {
+            const int t = t1 - u;
+            const float gv = __fmaf_rn(bt, gv_next, q[u]);
+            if (t > 0) gbeta = __fmaf_rn(gv, u + 1 < LIF_G ? va[u + 1] : vb[0], gbeta);
+            ob[(size_t)t * D] = f2bf(gv);
+            gv_next = gv;
+        }
+#pragma unroll
+        for (int u = 0; u < LIF_G; ++u) {
+            va[u] = vb[u];
+            ga[u] = gn[u];
+        }
+    }
+#pragma unroll
+    for (int u = 0; u < LIF_G - 1; ++u) {
+        const int t = t1 - u;
+        if (t >= 0) {
+            const float a = __fmaf_rn(fabsf(__fsub_rn(va[u], theta)), slope, 1.0f);
+            const float gv = __fmaf_rn(bt, gv_next, __fdiv_rn(ga[u], __fmul_rn(a, a)));
+            if (t > 0) gbeta = __fmaf_rn(gv, va[u + 1], gbeta);
+            ob[(size_t)t * D] = f2bf(gv);
+            gv_next = gv;
+        }
     }
     o[(size_t)T * D] = gbeta;
 }
@@ -1659,8 +1727,11 @@ __device__ __forceinline__ void hb_update(float (&F)[32], const float* Ks, float
     for (int i = 0; i < 32; ++i) F[i] = a * F[i] + Ks[i] * bee;
 }
 
-extern "C" __global__ void __launch_bounds__(128) hebb_fwd(const float* __restrict__ P, const float* __restrict__ cst, float* __restrict__ O,
-                                                           float* __restrict__ ck, int B, int H, int T, int ld, float eps) {
+// v40: the body is shared by hebb_fwd (O f32) and hebb_fwd_b (O as bf16, f2bf of the same values: the matmul operand
+// written directly instead of cast from f32 afterwards).
+template <typename OT>
+__device__ __forceinline__ void hebb_fwd_body(const float* __restrict__ P, const float* __restrict__ cst, OT* __restrict__ O,
+                                              float* __restrict__ ck, int B, int H, int T, int ld, float eps) {
     __shared__ float Qs[4][32], Ks[4][32];
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     const int bh = blockIdx.x * 4 + w;
@@ -1698,22 +1769,35 @@ extern "C" __global__ void __launch_bounds__(128) hebb_fwd(const float* __restri
         }
         const float y = (y0 + y1) + (y2 + y3);
         const float r = rsqrtf(wsum(y * y) * (1.0f / 32.0f) + eps);
-        O[((size_t)b * T + t) * d + h * 32 + lane] = y * r * (g * hb_sig(g));
+        put(O, ((size_t)b * T + t) * d + h * 32 + lane, y * r * (g * hb_sig(g)));
         __syncwarp();
     }
+}
+
+extern "C" __global__ void __launch_bounds__(128) hebb_fwd(const float* __restrict__ P, const float* __restrict__ cst, float* __restrict__ O,
+                                                           float* __restrict__ ck, int B, int H, int T, int ld, float eps) {
+    hebb_fwd_body<float>(P, cst, O, ck, B, H, T, ld, eps);
+}
+
+extern "C" __global__ void __launch_bounds__(128) hebb_fwd_b(const float* __restrict__ P, const float* __restrict__ cst, unsigned short* __restrict__ O,
+                                                             float* __restrict__ ck, int B, int H, int T, int ld, float eps) {
+    hebb_fwd_body<unsigned short>(P, cst, O, ck, B, H, T, ld, eps);
 }
 
 // Backward of hebb_fwd: dP [N, ld] (every column written) for dO [N, d]. Chunks of HB_C steps from the last: the
 // chunk's states are recomputed from its checkpoint into scratch [B*H, HB_C, 32, 32] (per warp, read back by the
 // thread that wrote it), then walked back through.
-extern "C" __global__ void __launch_bounds__(128) hebb_bwd(const float* __restrict__ P, const float* __restrict__ cst,
-                                                           const float* __restrict__ ck, float* __restrict__ scratch,
-                                                           const float* __restrict__ dO, float* __restrict__ dP,
-                                                           int B, int H, int T, int ld, float eps) {
-    __shared__ float Qs[4][32], Ks[4][32];
-    __shared__ float Rq[4][32][33], Rk[4][32][33];
+// v40: the body is shared by hebb_bwd (NW = 4 heads per block of 128 threads) and hebb_bwd_w1 (one head per block of
+// 32 threads, at most 168 registers): the same code per head, so the same bits.
+template <int NW, typename OT>
+__device__ __forceinline__ void hebb_bwd_body(const float* __restrict__ P, const float* __restrict__ cst,
+                                              const float* __restrict__ ck, float* __restrict__ scratch,
+                                              const float* __restrict__ dO, OT* __restrict__ dP, float* __restrict__ dz,
+                                              int B, int H, int T, int ld, float eps) {
+    __shared__ float Qs[NW][32], Ks[NW][32];
+    __shared__ float Rq[NW][32][33], Rk[NW][32][33];
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
-    const int bh = blockIdx.x * 4 + w;
+    const int bh = blockIdx.x * NW + w;
     if (bh >= B * H) return;
     const int b = bh / H, h = bh % H, d = H * 32, nck = (T + HB_C - 1) / HB_C;
     const float ca = cst[h] + cst[2 * H + h], cb = cst[H + h];
@@ -1817,20 +1901,57 @@ extern "C" __global__ void __launch_bounds__(128) hebb_bwd(const float* __restri
             const float dalpha = wsum(da - de * p), dbeta = wsum(e * sk);
             // unit-length q and k: dx = (dx^ - x^ (x^ . dx^)) / |x|
             const float dq = iq * (gq - qh * wsum(qh * gq)), dk = ik * (gk - kh * wsum(kh * gk));
-            float* o = dP + n * ld;
-            o[h * 32 + lane] = dq;
-            o[d + h * 32 + lane] = dk;
-            o[2 * d + h * 32 + lane] = de;
-            o[3 * d + h * 32 + lane] = dg;
+            OT* o = dP + n * ld;
+            put(o, h * 32 + lane, dq);
+            put(o, d + h * 32 + lane, dk);
+            put(o, 2 * d + h * 32 + lane, de);
+            put(o, 3 * d + h * 32 + lane, dg);
             if (lane == 0) {
-                o[4 * d + h] = dalpha * a * (1.0f - a);             // alpha = sigmoid(z)
-                o[4 * d + H + h] = dbeta * be * (1.0f - 0.5f * be); // beta = 2 sigmoid(z)
+                const float za = dalpha * a * (1.0f - a), zb = dbeta * be * (1.0f - 0.5f * be);
+                put(o, 4 * d + h, za);     // alpha = sigmoid(z)
+                put(o, 4 * d + H + h, zb); // beta = 2 sigmoid(z)
+                if (sizeof(OT) == 2) {     // v40: bf16 dP: dza, dzb also in f32 (dz [N, 2H]) for the bias gradients
+                    dz[n * 2 * H + h] = za;
+                    dz[n * 2 * H + H + h] = zb;
+                }
             }
 #pragma unroll
             for (int i = 0; i < 32; ++i) dF[i] = a * dF[i] + Ks[w][i] * dp;
             __syncwarp();
         }
     }
+}
+
+extern "C" __global__ void __launch_bounds__(128) hebb_bwd(const float* __restrict__ P, const float* __restrict__ cst,
+                                                           const float* __restrict__ ck, float* __restrict__ scratch,
+                                                           const float* __restrict__ dO, float* __restrict__ dP,
+                                                           int B, int H, int T, int ld, float eps) {
+    hebb_bwd_body<4, float>(P, cst, ck, scratch, dO, dP, nullptr, B, H, T, ld, eps);
+}
+
+// v40: one head per block, 9 blocks per SM: B·H = 384 heads (D at 32 x 256) fit the RTX 4070's 46 SMs in one wave
+// (hebb_bwd's 4-head blocks at 246 registers fit 92 blocks of the 96, so a second wave ran for the last 4).
+extern "C" __global__ void __launch_bounds__(32, 9) hebb_bwd_w1(const float* __restrict__ P, const float* __restrict__ cst,
+                                                               const float* __restrict__ ck, float* __restrict__ scratch,
+                                                               const float* __restrict__ dO, float* __restrict__ dP,
+                                                               int B, int H, int T, int ld, float eps) {
+    hebb_bwd_body<1, float>(P, cst, ck, scratch, dO, dP, nullptr, B, H, T, ld, eps);
+}
+
+// v40: hebb_bwd and hebb_bwd_w1 writing dP as bf16 (f2bf of the same values: the matmul operand) and dza, dzb in f32
+// at dz [N, 2H].
+extern "C" __global__ void __launch_bounds__(128) hebb_bwd_bf(const float* __restrict__ P, const float* __restrict__ cst,
+                                                              const float* __restrict__ ck, float* __restrict__ scratch,
+                                                              const float* __restrict__ dO, unsigned short* __restrict__ dP,
+                                                              float* __restrict__ dz, int B, int H, int T, int ld, float eps) {
+    hebb_bwd_body<4, unsigned short>(P, cst, ck, scratch, dO, dP, dz, B, H, T, ld, eps);
+}
+
+extern "C" __global__ void __launch_bounds__(32, 9) hebb_bwd_w1_bf(const float* __restrict__ P, const float* __restrict__ cst,
+                                                                  const float* __restrict__ ck, float* __restrict__ scratch,
+                                                                  const float* __restrict__ dO, unsigned short* __restrict__ dP,
+                                                                  float* __restrict__ dz, int B, int H, int T, int ld, float eps) {
+    hebb_bwd_body<1, unsigned short>(P, cst, ck, scratch, dO, dP, dz, B, H, T, ld, eps);
 }
 
 // ---- speed round 13: AdamW in place (w, m, v overwritten), the same arithmetic as adamw_step ----
@@ -1859,6 +1980,115 @@ extern "C" __global__ void adamw_inplace_s(float* __restrict__ w, const float* _
     const float vi = v[i] * b2 + (gi * gi) * c2;
     const float den = sqrtf(vi) * ibc2 + eps;
     w[i] = w[i] * shrink - (mi / den) * step;
+    m[i] = mi;
+    v[i] = vi;
+}
+
+// ---- v40 (a faster block): the optimiser step in a few launches instead of ~700 small ones ----
+// Squared gradient norm with exactly the grouping of AdamW::grad_norm_t's candle ops: per tensor sqr, then
+// sum_keepdim(-1) (candle's fast_sum: one block of bd = next_pow2(min(1024, cols)) threads per row; thread v adds
+// elements v, v + bd, v + 2 bd, ... in order, then a tree s = bd/2 .. 1), then sum_all of the row sums (the same with
+// bd over the rows), then the tensors' sums added in order (f32), then the f64 sqrt. A rank-1 tensor is one row (its
+// sum_all is that block). One warp stands in for one such block: virtual thread v = lane + 32 j keeps its partial
+// sum in acc[j]; tree steps s >= 32 stay inside the lane, s < 32 are shuffles. f32 addition is commutative, so the
+// grouping (candle's) fixes every rounding: the same bits as the per-tensor ops.
+// gn_tab[4 i ..] = (data pointer, rows, cols, index of the tensor's first row).
+template <int J, bool SQ>
+__device__ __forceinline__ float gn_block_sum(const float* __restrict__ x, int n, int bd) {
+    const int lane = threadIdx.x & 31;
+    float acc[J];
+#pragma unroll
+    for (int j = 0; j < J; ++j) {
+        float a = 0.0f;
+        for (int i = lane + 32 * j; i < n; i += bd) {
+            const float v = x[i];
+            a = __fadd_rn(a, SQ ? __fmul_rn(v, v) : v);
+        }
+        acc[j] = a;
+    }
+#pragma unroll
+    for (int s = J / 2; s >= 1; s >>= 1) {
+#pragma unroll
+        for (int j = 0; j < s; ++j) acc[j] = __fadd_rn(acc[j], acc[j + s]);
+    }
+    float r = acc[0];
+    for (int s = (bd < 32 ? bd : 32) / 2; s >= 1; s >>= 1) r = __fadd_rn(r, __shfl_down_sync(0xffffffffu, r, s));
+    return r;
+}
+
+__device__ __forceinline__ float gn_sum_any(const float* __restrict__ x, int n, bool sq) {
+    int bd = 1;
+    while (bd < n && bd < 1024) bd <<= 1;
+    switch (bd > 32 ? bd >> 5 : 1) {
+    case 1: return sq ? gn_block_sum<1, true>(x, n, bd) : gn_block_sum<1, false>(x, n, bd);
+    case 2: return sq ? gn_block_sum<2, true>(x, n, bd) : gn_block_sum<2, false>(x, n, bd);
+    case 4: return sq ? gn_block_sum<4, true>(x, n, bd) : gn_block_sum<4, false>(x, n, bd);
+    case 8: return sq ? gn_block_sum<8, true>(x, n, bd) : gn_block_sum<8, false>(x, n, bd);
+    case 16: return sq ? gn_block_sum<16, true>(x, n, bd) : gn_block_sum<16, false>(x, n, bd);
+    default: return sq ? gn_block_sum<32, true>(x, n, bd) : gn_block_sum<32, false>(x, n, bd);
+    }
+}
+
+// Stage 1, one warp per row of every tensor: rs[row] = the row's sum of squares.
+extern "C" __global__ void gn_rows(const unsigned long long* __restrict__ tab, int ntens, int nrows, float* __restrict__ rs) {
+    const int w = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+    if (w >= nrows) return;
+    int lo = 0, hi = ntens - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if ((long long)tab[4 * mid + 3] <= (long long)w) lo = mid;
+        else hi = mid - 1;
+    }
+    const int cols = (int)tab[4 * lo + 2];
+    const float* x = reinterpret_cast<const float*>(tab[4 * lo]) + (size_t)(w - (long long)tab[4 * lo + 3]) * cols;
+    const float r = gn_sum_any(x, cols, true);
+    if ((threadIdx.x & 31) == 0) rs[w] = r;
+}
+
+// Stage 2, one block: each warp sums one tensor's row sums (ts[i]); then thread 0 adds the tensors' sums in order
+// and writes sqrt as f64 (the cast to f64 is exact; sqrt is correctly rounded, as candle's usqrt_f64).
+extern "C" __global__ void gn_final(const unsigned long long* __restrict__ tab, int ntens, const float* __restrict__ rs, float* __restrict__ ts,
+                                    double* __restrict__ out) {
+    const int w = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    for (int i = w; i < ntens; i += nw) {
+        const float s = gn_sum_any(rs + tab[4 * i + 3], (int)tab[4 * i + 1], false);
+        if ((threadIdx.x & 31) == 0) ts[i] = s;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float acc = ts[0];
+        for (int i = 1; i < ntens; ++i) acc = __fadd_rn(acc, ts[i]);
+        out[0] = sqrt((double)acc);
+    }
+}
+
+// AdamW over many tensors in one launch, element for element the arithmetic of adamw_inplace_s. Block b updates
+// elements (b - first) * blockDim.x + tid of the tensor whose block range holds b. aw_tab[6 i ..] = (w, g, m, v
+// pointers, n, first block | shrink bits << 32).
+extern "C" __global__ void adamw_multi(const unsigned long long* __restrict__ tab, int ntens, const double* __restrict__ sp, float b1, float c1,
+                                       float b2, float c2, float eps, float step, float ibc2) {
+    const long long b = blockIdx.x;
+    int lo = 0, hi = ntens - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if ((long long)(tab[6 * mid + 5] & 0xffffffffull) <= b) lo = mid;
+        else hi = mid - 1;
+    }
+    const unsigned long long* e = tab + 6 * lo;
+    const long long i = (b - (long long)(e[5] & 0xffffffffull)) * blockDim.x + threadIdx.x;
+    if (i >= (long long)e[4]) return;
+    float* __restrict__ w = reinterpret_cast<float*>(e[0]);
+    const float* __restrict__ g = reinterpret_cast<const float*>(e[1]);
+    float* __restrict__ m = reinterpret_cast<float*>(e[2]);
+    float* __restrict__ v = reinterpret_cast<float*>(e[3]);
+    const float shrink = __uint_as_float((unsigned int)(e[5] >> 32));
+    const float s = __double2float_rn(sp[0]);
+    // the contractions nvcc chose for adamw_inplace_s (read from its SASS), spelled out so they cannot differ
+    const float gi = __fmul_rn(g[i], s);
+    const float mi = __fmaf_rn(m[i], b1, __fmul_rn(gi, c1));
+    const float vi = __fmaf_rn(v[i], b2, __fmul_rn(__fmul_rn(gi, gi), c2));
+    const float den = __fmaf_rn(sqrtf(vi), ibc2, eps);
+    w[i] = __fmaf_rn(w[i], shrink, -__fmul_rn(mi / den, step));
     m[i] = mi;
     v[i] = vi;
 }
@@ -2196,8 +2426,9 @@ extern "C" __global__ void __launch_bounds__(128) hc_scan(const float* __restric
 
 // Forward 3, one warp per chunk (lane = value channel j): y from the chunk's start state (ck) and Delta (from
 // hc_scan), then O = y rsqrt(mean y^2 + eps) silu(g).
-extern "C" __global__ void __launch_bounds__(32) hc_out(const float* __restrict__ P, const float* __restrict__ cst, const float* __restrict__ DL,
-                                                        const float* __restrict__ ck, float* __restrict__ O, int B, int H, int T, int ld, float eps) {
+template <typename OT>
+__device__ __forceinline__ void hc_out_body(const float* __restrict__ P, const float* __restrict__ cst, const float* __restrict__ DL,
+                                            const float* __restrict__ ck, OT* __restrict__ O, int B, int H, int T, int ld, float eps) {
     __shared__ __align__(16) float q[HC_C][HC_P], k[HC_C][HC_P];
     __shared__ float M[HC_C][HC_C + 1], lg[HC_C], be[HC_C], al[HC_C], iq[HC_C], ik[HC_C];
     const int lane = threadIdx.x & 31, nC = (T + HC_C - 1) / HC_C, cid = blockIdx.x, bh = cid / nC, c = cid % nC, t2 = lane >> 1;
@@ -2230,18 +2461,31 @@ extern "C" __global__ void __launch_bounds__(32) hc_out(const float* __restrict_
         if (t < n) {
             const size_t row = (size_t)b * T + c * HC_C + t;
             const float g = P[row * ld + 3 * d + h * 32 + lane];
-            O[row * d + h * 32 + lane] = y[t] * rt * (g * hb_sig(g));
+            put(O, row * d + h * 32 + lane, y[t] * rt * (g * hb_sig(g)));
         }
     }
+}
+
+extern "C" __global__ void __launch_bounds__(32) hc_out(const float* __restrict__ P, const float* __restrict__ cst, const float* __restrict__ DL,
+                                                        const float* __restrict__ ck, float* __restrict__ O, int B, int H, int T, int ld, float eps) {
+    hc_out_body<float>(P, cst, DL, ck, O, B, H, T, ld, eps);
+}
+
+// v40: hc_out writing O as bf16 (the matmul operand).
+extern "C" __global__ void __launch_bounds__(32) hc_out_b(const float* __restrict__ P, const float* __restrict__ cst, const float* __restrict__ DL,
+                                                          const float* __restrict__ ck, unsigned short* __restrict__ O, int B, int H, int T, int ld,
+                                                          float eps) {
+    hc_out_body<unsigned short>(P, cst, DL, ck, O, B, H, T, ld, eps);
 }
 
 // Backward 1, one warp per chunk (lane = value channel j): the WY form and y again (as hc_prep and hc_out), then dO
 // back through the gate and head norm (dg into dP, dY), X1 = M^T dY and X2 = Q^T diag(gamma) dY; W, Kd, gC for
 // hc_bscan.
-extern "C" __global__ void __launch_bounds__(32) hc_bout(const float* __restrict__ P, const float* __restrict__ cst, const float* __restrict__ ck,
-                                                         const float* __restrict__ dO, float* __restrict__ W, float* __restrict__ Kd,
-                                                         float* __restrict__ gC, float* __restrict__ dP, float* __restrict__ DY,
-                                                         float* __restrict__ X1, float* __restrict__ X2, int B, int H, int T, int ld, float eps) {
+template <typename OT>
+__device__ __forceinline__ void hc_bout_body(const float* __restrict__ P, const float* __restrict__ cst, const float* __restrict__ ck,
+                                             const float* __restrict__ dO, float* __restrict__ W, float* __restrict__ Kd,
+                                             float* __restrict__ gC, OT* __restrict__ dP, float* __restrict__ DY,
+                                             float* __restrict__ X1, float* __restrict__ X2, int B, int H, int T, int ld, float eps) {
     __shared__ __align__(16) float q[HC_C][HC_P], k[HC_C][HC_P], w[HC_C][HC_P];
     __shared__ float A[HC_C][HC_C + 1], M[HC_C][HC_C + 1], lg[HC_C], be[HC_C], al[HC_C], iq[HC_C], ik[HC_C];
     const int lane = threadIdx.x & 31, nC = (T + HC_C - 1) / HC_C, cid = blockIdx.x, bh = cid / nC, c = cid % nC, t2 = lane >> 1;
@@ -2294,7 +2538,7 @@ extern "C" __global__ void __launch_bounds__(32) hc_bout(const float* __restrict
                 const float g = P[row * ld + 3 * d + h * 32 + lane], dov = dO[row * d + h * 32 + lane];
                 const float sg = hb_sig(g), silu = g * sg;
                 yn[t] = y[t] * rt;
-                dP[row * ld + 3 * d + h * 32 + lane] = dov * yn[t] * sg * (1.0f + g * (1.0f - sg));
+                put(dP, row * ld + 3 * d + h * 32 + lane, dov * yn[t] * sg * (1.0f + g * (1.0f - sg)));
                 dyn[t] = dov * silu;
             }
             pm[t] = dyn[t] * yn[t];
@@ -2334,6 +2578,21 @@ extern "C" __global__ void __launch_bounds__(32) hc_bout(const float* __restrict
         x2[(4 * i4 + 2) * 32] = x2v;
         x2[(4 * i4 + 3) * 32] = x3;
     }
+}
+
+extern "C" __global__ void __launch_bounds__(32) hc_bout(const float* __restrict__ P, const float* __restrict__ cst, const float* __restrict__ ck,
+                                                         const float* __restrict__ dO, float* __restrict__ W, float* __restrict__ Kd,
+                                                         float* __restrict__ gC, float* __restrict__ dP, float* __restrict__ DY,
+                                                         float* __restrict__ X1, float* __restrict__ X2, int B, int H, int T, int ld, float eps) {
+    hc_bout_body<float>(P, cst, ck, dO, W, Kd, gC, dP, DY, X1, X2, B, H, T, ld, eps);
+}
+
+// v40: hc_bout writing dP's dg columns as bf16 (into hc_bmain_b's bf16 dP).
+extern "C" __global__ void __launch_bounds__(32) hc_bout_b(const float* __restrict__ P, const float* __restrict__ cst, const float* __restrict__ ck,
+                                                           const float* __restrict__ dO, float* __restrict__ W, float* __restrict__ Kd,
+                                                           float* __restrict__ gC, unsigned short* __restrict__ dP, float* __restrict__ DY,
+                                                           float* __restrict__ X1, float* __restrict__ X2, int B, int H, int T, int ld, float eps) {
+    hc_bout_body<unsigned short>(P, cst, ck, dO, W, Kd, gC, dP, DY, X1, X2, B, H, T, ld, eps);
 }
 
 // Backward 2, one block of 128 threads per head from the last chunk (thread layout as hc_scan): G = gradient of the
@@ -2428,9 +2687,10 @@ extern "C" __global__ void __launch_bounds__(128) hc_bscan(const float* __restri
 
 // Backward 3, one warp per chunk: with the chunk's start state (ck), the gradient of its end state (dFn), dDelta (DD)
 // and dY (DY), the gradients of q, k, v, za and zb (dg came from hc_bout).
-extern "C" __global__ void __launch_bounds__(32) hc_bmain(const float* __restrict__ P, const float* __restrict__ cst, const float* __restrict__ ck,
-                                                          const float* __restrict__ dFn, const float* __restrict__ DD, const float* __restrict__ DY,
-                                                          float* __restrict__ dP, int B, int H, int T, int ld) {
+template <typename OT>
+__device__ __forceinline__ void hc_bmain_body(const float* __restrict__ P, const float* __restrict__ cst, const float* __restrict__ ck,
+                                              const float* __restrict__ dFn, const float* __restrict__ DD, const float* __restrict__ DY,
+                                              OT* __restrict__ dP, float* __restrict__ dz, int B, int H, int T, int ld) {
     __shared__ __align__(16) float q[HC_C][HC_P], k[HC_C][HC_P], dl[HC_C][HC_P], Z[HC_C][HC_P], dy[HC_C][HC_P];
     __shared__ __align__(16) float L[HC_C][HC_Q], M[HC_C][HC_Q], DL[HC_C][HC_Q], DM[HC_C][HC_Q];
     __shared__ float lg[HC_C], be[HC_C], al[HC_C], iq[HC_C], ik[HC_C], dlg[HC_C], dbe[HC_C], qd[HC_C], kq[HC_C];
@@ -2501,7 +2761,7 @@ extern "C" __global__ void __launch_bounds__(32) hc_bmain(const float* __restric
             const float bz = be[t] * z[t];
             p1[t] = z[t] * R[t];
             pg[t] = bz * gkf[t];
-            if (t < n) dP[((size_t)b * T + c * HC_C + t) * ld + 2 * d + h * 32 + lane] = bz;
+            if (t < n) put(dP, ((size_t)b * T + c * HC_C + t) * ld + 2 * d + h * 32 + lane, bz);
         }
         s1 = hc_rsum16(p1);
         s2b = hc_rsum16(pg);
@@ -2644,15 +2904,113 @@ extern "C" __global__ void __launch_bounds__(32) hc_bmain(const float* __restric
     }
     if (lane < n) {
         const size_t row = (size_t)b * T + c * HC_C + lane;
-        dP[row * ld + 4 * d + h] = x * (1.0f - al[lane]);
-        dP[row * ld + 4 * d + H + h] = dbe[lane] * be[lane] * (1.0f - 0.5f * be[lane]);
+        const float za = x * (1.0f - al[lane]), zb = dbe[lane] * be[lane] * (1.0f - 0.5f * be[lane]);
+        put(dP, row * ld + 4 * d + h, za);
+        put(dP, row * ld + 4 * d + H + h, zb);
+        if (sizeof(OT) == 2) { // v40: bf16 dP: dza, dzb also in f32 (dz [N, 2H]) for the bias gradients
+            dz[row * 2 * H + h] = za;
+            dz[row * 2 * H + H + h] = zb;
+        }
     }
 #pragma unroll
     for (int t = 0; t < HC_C; ++t) {
         if (t < n) {
             const size_t row = (size_t)b * T + c * HC_C + t;
-            dP[row * ld + h * 32 + lane] = iq[t] * (dq[t] - qc[t] * qd[t]);
-            dP[row * ld + d + h * 32 + lane] = ik[t] * (dk[t] - kc[t] * kq[t]);
+            put(dP, row * ld + h * 32 + lane, iq[t] * (dq[t] - qc[t] * qd[t]));
+            put(dP, row * ld + d + h * 32 + lane, ik[t] * (dk[t] - kc[t] * kq[t]));
         }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(32) hc_bmain(const float* __restrict__ P, const float* __restrict__ cst, const float* __restrict__ ck,
+                                                          const float* __restrict__ dFn, const float* __restrict__ DD, const float* __restrict__ DY,
+                                                          float* __restrict__ dP, int B, int H, int T, int ld) {
+    hc_bmain_body<float>(P, cst, ck, dFn, DD, DY, dP, nullptr, B, H, T, ld);
+}
+
+// v40: hc_bmain writing dP as bf16 (the matmul operand) and dza, dzb in f32 at dz [N, 2H].
+extern "C" __global__ void __launch_bounds__(32) hc_bmain_b(const float* __restrict__ P, const float* __restrict__ cst, const float* __restrict__ ck,
+                                                            const float* __restrict__ dFn, const float* __restrict__ DD, const float* __restrict__ DY,
+                                                            unsigned short* __restrict__ dP, float* __restrict__ dz, int B, int H, int T, int ld) {
+    hc_bmain_body<unsigned short>(P, cst, ck, dFn, DD, DY, dP, dz, B, H, T, ld);
+}
+
+// ---------------------------------------------------------------- v39: the glance's place ids
+// out[i] = the place of token i in its row of length t (ids are [rows, t] row-major): for a digit (ids 48..57) at
+// index k of its run, if the token before the run is a length mark 4096 + L − 1 with L <= 15 and k < L, the place
+// is L − 1 − k (0 = units); everything else is 16 (none). The look-back stops at the row start and after 16
+// digits. Same rule as ava_data::numbers::place_ids (tested against it).
+extern "C" __global__ void place_ids(const unsigned int* __restrict__ ids, unsigned int* __restrict__ out, int n, int t) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    unsigned int tok = ids[i];
+    unsigned int p = 16u;
+    if (tok >= 48u && tok <= 57u) {
+        int pos = i % t;
+        int row0 = i - pos;
+        int k = 0;
+        while (k < 16 && pos - k - 1 >= 0) {
+            unsigned int u = ids[row0 + pos - k - 1];
+            if (u < 48u || u > 57u) break;
+            k++;
+        }
+        if (k < 16 && pos - k - 1 >= 0) {
+            unsigned int m = ids[row0 + pos - k - 1];
+            if (m >= 4096u && m < 4096u + 15u) {
+                int len = (int)(m - 4096u) + 1;
+                if (k < len) p = (unsigned int)(len - 1 - k);
+            }
+        }
+    }
+    out[i] = p;
+}
+
+// v40: the magnitude code ("how much"), the rule of src/mag.rs: one thread per token, double precision.
+// out [n, 14]: [1, m/16, sin(2 pi m/P), cos(2 pi m/P) for P = 1, 2, 4, 8, 16, 32] where m is the token's place on
+// the log10 number line (a length mark: L - 0.5; a digit: the middle of what the number can still be), or all 0.
+extern "C" __global__ void mag_feats(const unsigned int* __restrict__ ids, float* __restrict__ out, int n, int t) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    unsigned int tok = ids[i];
+    int pos = i % t;
+    int row0 = i - pos;
+    bool has = false;
+    double m = 0.0;
+    if (tok >= 4096u && tok < 4112u) {
+        int len = (int)(tok - 4096u) + 1;
+        if (len <= 15) { m = (double)len - 0.5; has = true; }
+    } else if (tok >= 48u && tok <= 57u) {
+        int k = 0;
+        while (k < 16 && pos - k - 1 >= 0) {
+            unsigned int u = ids[row0 + pos - k - 1];
+            if (u < 48u || u > 57u) break;
+            k++;
+        }
+        if (pos - k - 1 >= 0 && k < 16) {
+            unsigned int mk = ids[row0 + pos - k - 1];
+            if (mk >= 4096u && mk < 4112u) {
+                int len = (int)(mk - 4096u) + 1;
+                if (len <= 15 && k < len) {
+                    double v = 0.0;
+                    for (int j = pos - k; j <= pos; ++j) v = v * 10.0 + (double)(ids[row0 + j] - 48u);
+                    int r = len - 1 - k;
+                    m = (r == 0) ? log10(v + 1.0) : log10((v + 0.5) * pow(10.0, (double)r) + 1.0);
+                    has = true;
+                }
+            }
+        }
+    }
+    float* o = out + (size_t)i * 14;
+    if (!has) {
+        for (int j = 0; j < 14; ++j) o[j] = 0.0f;
+        return;
+    }
+    const double periods[6] = {1.0, 2.0, 4.0, 8.0, 16.0, 32.0};
+    o[0] = 1.0f;
+    o[1] = (float)(m / 16.0);
+    for (int j = 0; j < 6; ++j) {
+        double a = 2.0 * 3.14159265358979323846 * m / periods[j];
+        o[2 + 2 * j] = (float)sin(a);
+        o[3 + 2 * j] = (float)cos(a);
     }
 }

@@ -1,7 +1,10 @@
 // TESTING / DESIGN ONLY — blimp_gpu: BLiMP minimal pairs for a train_gpu checkpoint (model.safetensors).
 //
 // blimp_gpu --model FILE --arch S|F|G|T --d D --layers L [--ctx 256] [--dir data/blimp] [--batch 256]
-//           [--limit N per phenomenon] [--cpu] [--bpe FILE]
+//           [--limit N per phenomenon] [--cpu] [--bpe FILE] [--glance]
+//
+// v39 --glance: a model D trained with the glance (vocab 4112); every sentence gets its length marks
+// (ava_data::numbers::insert_marks) before scoring, as her training text had them.
 //
 // Same method as brain/examples/blimp_score.rs: every sentence is scored as [EOS] sentence [EOS]
 // (`Bpe::encode_doc` appends the closing EOS; the first EOS is context, not scored), and the model is
@@ -10,15 +13,15 @@
 // PAD; every model here is causal, so padding after a sentence cannot change its scores, and PAD
 // targets are not scored.
 
-use ava_data::bpe::{Bpe, EOS, PAD};
-use ava_gpu::model::{Config, Kind, Model, VOCAB};
-use candle_core::{DType, Device, Tensor, D};
-use candle_nn::{VarBuilder, VarMap};
+use ava_data::bpe::{Bpe, EOS};
+use ava_data::numbers::insert_marks;
+use ava_gpu::eval::seq_nll;
+use ava_gpu::model::Kind;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 const USAGE: &str = "usage: blimp_gpu --model FILE --arch S|F|G|T --d D --layers L [--ctx 256] [--dir DIR] [--batch 256]\n\
-    \x20                [--limit N] [--cpu] [--bpe FILE]";
+    \x20                [--limit N] [--cpu] [--bpe FILE] [--glance]";
 
 fn main() {
     if let Err(e) = run() {
@@ -47,40 +50,12 @@ fn field(line: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Total NLL in nats of every sequence (the first token is context and not scored).
-fn seq_nll(model: &Model, dev: &Device, seqs: &[Vec<u32>], batch: usize) -> candle_core::Result<Vec<f64>> {
-    let mut out = vec![0.0f64; seqs.len()];
-    let mut order: Vec<usize> = (0..seqs.len()).collect();
-    order.sort_by_key(|&i| seqs[i].len());
-    for chunk in order.chunks(batch.max(1)) {
-        let t = chunk.iter().map(|&i| seqs[i].len()).max().unwrap_or(2).saturating_sub(1).max(1);
-        let b = chunk.len();
-        let (mut ids, mut tg, mut keep) = (Vec::with_capacity(b * t), Vec::with_capacity(b * t), Vec::with_capacity(b * t));
-        for &i in chunk {
-            let s = &seqs[i];
-            for p in 0..t {
-                let real = p + 1 < s.len();
-                ids.push(if real { s[p] } else { PAD });
-                tg.push(if real { s[p + 1] } else { 0 });
-                keep.push(if real { 1f32 } else { 0f32 });
-            }
-        }
-        let logits = model.forward(&Tensor::from_vec(ids, (b, t), dev)?)?; // [b·t, V]
-        let lp = candle_nn::ops::log_softmax(&logits, D::Minus1)?;
-        let picked = lp.gather(&Tensor::from_vec(tg, (b * t, 1), dev)?, 1)?.squeeze(1)?;
-        let nll: Vec<f32> = picked.neg()?.mul(&Tensor::from_vec(keep, b * t, dev)?)?.reshape((b, t))?.sum(1)?.to_vec1()?;
-        for (r, &i) in chunk.iter().enumerate() {
-            out[i] = nll[r] as f64;
-        }
-    }
-    Ok(out)
-}
-
 fn run() -> Result<(), String> {
     let mut model_path: Option<PathBuf> = None;
     let (mut d, mut layers, mut ctx, mut batch, mut limit) = (0usize, 0usize, 256usize, 256usize, usize::MAX);
     let mut kind = Kind::S;
     let mut cpu = false;
+    let mut glance = false;
     let mut bpe_path = PathBuf::from(ava_gpu::DEFAULT_BPE);
     let mut dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../data/blimp"));
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -90,8 +65,12 @@ fn run() -> Result<(), String> {
         if key == "-h" || key == "--help" {
             return Err(USAGE.into());
         }
-        if key == "--cpu" {
-            cpu = true;
+        if key == "--cpu" || key == "--glance" {
+            if key == "--cpu" {
+                cpu = true;
+            } else {
+                glance = true;
+            }
             i += 1;
             continue;
         }
@@ -117,10 +96,7 @@ fn run() -> Result<(), String> {
     }
     let dev = ava_gpu::device(cpu).map_err(|e| format!("device: {e}"))?;
     let bpe = Bpe::load(&bpe_path).map_err(|e| format!("bpe {}: {e}", bpe_path.display()))?;
-    let mut varmap = VarMap::new();
-    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
-    let model = Model::new(Config::with_kind(kind, VOCAB, d, layers, ctx), vb).map_err(|e| format!("model: {e}"))?;
-    varmap.load(&model_path).map_err(|e| format!("load {}: {e}", model_path.display()))?;
+    let (_cfg, _varmap, model) = ava_gpu::ckpt::load_expect(&model_path, kind, ctx, d, layers, glance, &dev)?;
 
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
         .map_err(|e| format!("blimp dir {}: {e}", dir.display()))?
@@ -143,7 +119,7 @@ fn run() -> Result<(), String> {
             for s in [g, b] {
                 let mut t = vec![EOS];
                 t.extend(bpe.encode_doc(&s));
-                seqs.push(t);
+                seqs.push(if glance { insert_marks(&t) } else { t });
             }
         }
         let nll = seq_nll(&model, &dev, &seqs, batch).map_err(|e| format!("score: {e}"))?;

@@ -1,0 +1,8 @@
+phase	init	mag	engram	ctx	batch	tokens	steps	lr	qa_examples	qa_every	recall_every	recall_rows_total	long_ctx	long_from_step	loss_tail	train_seconds	tokens_per_sec	val_bpb
+grow	design-tests/nn/gpu/runs/v39/ava-num/model.safetensors	true	Some(4)	2048	4	108134400	13200	0.0003	42140	5.128	2	6600	8192	9900	2.934729	2040.20	58004.4	1.494022
+
+phase	init	facts	episodes	steps	sleep_rows	cycles	surprise_alpha	lr	episode_loss_before	episode_loss_after	anchor	fisher_batches	anchor_drift	train_seconds	tokens_per_sec	val_bpb
+sleep	design-tests/nn/gpu/runs/v41/grow/model.safetensors	data/v41/sealed/sleep_test_facts.txt	150	300	16	4	1	0.0003	5.011960	0.144027	100	16	8.741686e-7	24.74	34978.6	1.509961
+
+phase	init	sets	steps	items	norm	anchor	fisher_batches	anchor_drift	tau	temp	temp_score_units	mean_choice_bytes	lr	right	wrong	abstained	train_seconds	val_bpb
+reward	design-tests/nn/gpu/runs/v41/sleep/model.safetensors	data/v41/reward_train.tsv	300	16	byte	100	16	1.356165e-7	0	1	0.062998	15.873	0.0001	2940	1860	0	51.23	1.510709

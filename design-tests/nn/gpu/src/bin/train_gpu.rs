@@ -16,10 +16,15 @@
 // * At the end: validation BPB on iter_sequential(ctx) of the val shards (first --eval-tokens targets,
 //   PAD skipped, EOS = 1 byte), one line appended to DIR/result.tsv.
 // * --bench-steps N: run N steps, print tokens/s (first step excluded), write nothing, no evaluation.
+// * v39 --glance (model D only): the shards carry a length mark before every digit run (vocab 4112, see
+//   ava_data::numbers) and each digit gets a learned place embedding. The train and val shards must say vocab
+//   4112 (and 4096 without --glance). Marks are 0 bytes, so their loss counts against her BPB. result.tsv gains
+//   a last column `glance` (only on glance runs); the resume signature gains glance=1.
 
 use ava_data::bpe::Bpe;
+use ava_data::numbers::VOCAB_GLANCE;
 use ava_data::shards::{Cursor, Sampler, ShardSet};
-use ava_gpu::eval::{byte_lengths, evaluate, train_io};
+use ava_gpu::eval::{byte_lengths_n, evaluate, train_io};
 use ava_gpu::model::{Activity, Config, Kind, Model, VOCAB};
 use ava_gpu::optim::{clip_scale, clip_scale_t, cosine_lr, AdamW, Param};
 use candle_core::{DType, Tensor};
@@ -55,12 +60,13 @@ struct Args {
     train: PathBuf,
     val: PathBuf,
     bpe: PathBuf,
+    glance: bool,
 }
 
 const USAGE: &str = "usage: train_gpu [--model S|T] --d D --layers L --lr LR --out DIR [--ctx 256] [--batch 64] [--tokens 20M]\n\
     \x20            [--warmup 100] [--min-lr-frac 0.1] [--wd 0.1] [--clip 1.0] [--seed 1] [--data-seed 1]\n\
     \x20            [--eval-tokens 500000] [--eval-batch 16] [--log-every 50] [--max-steps N] [--bench-steps N]\n\
-    \x20            [--cpu] [--train DIR] [--val DIR] [--bpe FILE] [--ckpt-every 500] [--resume]";
+    \x20            [--cpu] [--train DIR] [--val DIR] [--bpe FILE] [--ckpt-every 500] [--resume] [--glance]";
 
 /// "4M", "500k", "1.5B" or a plain integer.
 fn parse_count(s: &str) -> Result<u64, String> {
@@ -102,6 +108,7 @@ fn parse_args() -> Result<Args, String> {
         train: PathBuf::from(ava_gpu::DEFAULT_TRAIN),
         val: PathBuf::from(ava_gpu::DEFAULT_VAL),
         bpe: PathBuf::from(ava_gpu::DEFAULT_BPE),
+        glance: false,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -112,11 +119,11 @@ fn parse_args() -> Result<Args, String> {
         if key == "-h" || key == "--help" {
             return Err(USAGE.to_string());
         }
-        if key == "--cpu" || key == "--resume" {
-            if key == "--cpu" {
-                a.cpu = true;
-            } else {
-                a.resume = true;
+        if key == "--cpu" || key == "--resume" || key == "--glance" {
+            match key {
+                "--cpu" => a.cpu = true,
+                "--resume" => a.resume = true,
+                _ => a.glance = true,
             }
             i += 1;
             continue;
@@ -180,7 +187,11 @@ fn run() -> Result<(), String> {
     }
     println!("device: {}", if dev.is_cuda() { "cuda:0" } else { "cpu" });
 
-    let cfg = Config::with_kind(a.kind, VOCAB, a.d, a.layers, a.ctx);
+    let vocab = if a.glance { VOCAB_GLANCE } else { VOCAB };
+    let mut cfg = Config::with_kind(a.kind, vocab, a.d, a.layers, a.ctx);
+    if a.glance {
+        cfg = cfg.with_glance().map_err(|e| format!("--glance: {e}"))?;
+    }
     let tok_per_step = (a.batch * a.ctx) as u64;
     let steps = (a.tokens / tok_per_step) as usize;
     if steps == 0 && a.bench_steps.is_none() {
@@ -194,6 +205,9 @@ fn run() -> Result<(), String> {
 
     // ---- data
     let train_set = ShardSet::open(&a.train).map_err(|e| format!("open train shards {}: {e}", a.train.display()))?;
+    if train_set.vocab_size as usize != vocab {
+        return Err(format!("train shards {} have vocab {}, this run needs {vocab} (--glance needs marked shards)", a.train.display(), train_set.vocab_size));
+    }
     let mut sampler = Sampler::new(&train_set, a.ctx, a.data_seed).map_err(|e| format!("sampler: {e}"))?;
 
     // ---- model + optimiser
@@ -208,7 +222,15 @@ fn run() -> Result<(), String> {
     let params: Vec<Param> = names.into_iter().map(|(name, var)| Param { decay: Model::decays(&name), name, var }).collect();
     let n_decay = params.iter().filter(|p| p.decay).count();
     let mut opt = AdamW::new(params, a.wd as f64).map_err(|e| format!("adamw: {e}"))?;
-    println!("model {} d={} layers={} ctx={} vocab={VOCAB}: weights {w_total} total, {w_nonembed} non-embedding; {n_decay} decayed tensors of {}", a.kind.name(), a.d, a.layers, a.ctx, opt.params().len());
+    println!(
+        "model {} d={} layers={} ctx={} vocab={vocab}{}: weights {w_total} total, {w_nonembed} non-embedding; {n_decay} decayed tensors of {}",
+        a.kind.name(),
+        a.d,
+        a.layers,
+        a.ctx,
+        if a.glance { " glance" } else { "" },
+        opt.params().len()
+    );
     println!(
         "batch {} x ctx {} = {tok_per_step} tokens/step; schedule {steps} steps ({} tokens); running {steps_run} steps; lr {} warmup {} min-lr-frac {} wd {} clip {} seed {} data-seed {}",
         a.batch,
@@ -399,8 +421,11 @@ fn run() -> Result<(), String> {
 
     // ---- validation
     let bpe = Bpe::load(&a.bpe).map_err(|e| format!("bpe {}: {e}", a.bpe.display()))?;
-    let byte_len = byte_lengths(&bpe);
+    let byte_len = byte_lengths_n(&bpe, vocab);
     let val_set = ShardSet::open(&a.val).map_err(|e| format!("open val shards {}: {e}", a.val.display()))?;
+    if val_set.vocab_size as usize != vocab {
+        return Err(format!("val shards {} have vocab {}, this run needs {vocab}", a.val.display(), val_set.vocab_size));
+    }
     let t_eval = Instant::now();
     let (acc, windows) = evaluate(&model, val_set.iter_sequential(a.ctx), a.eval_batch, a.eval_tokens, &byte_len, &dev).map_err(|e| format!("eval: {e}"))?;
     let eval_s = t_eval.elapsed().as_secs_f64();
@@ -414,14 +439,15 @@ fn run() -> Result<(), String> {
     let new_file = fs::metadata(&res_path).map(|m| m.len() == 0).unwrap_or(true);
     let mut f = OpenOptions::new().create(true).append(true).open(&res_path).map_err(|e| format!("result.tsv: {e}"))?;
     if new_file {
-        writeln!(
+        write!(
             f,
             "model\tdevice\td\tlayers\tctx\tbatch\ttokens\tsteps\tsteps_run\tlr\twarmup\tmin_lr_frac\twd\tclip\tseed\tdata_seed\teval_tokens\t\
              weights_total\tweights_nonembed\ttrain_loss_last50\tval_loss_nats_per_token\tval_bpb\tval_tokens_scored\tval_bytes\ttrain_seconds\teval_seconds\ttokens_per_sec"
         )
         .map_err(|e| e.to_string())?;
+        writeln!(f, "{}", if a.glance { "\tglance" } else { "" }).map_err(|e| e.to_string())?;
     }
-    writeln!(
+    write!(
         f,
         "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{:.2}\t{:.2}\t{:.1}",
         a.kind.name(),
@@ -453,6 +479,7 @@ fn run() -> Result<(), String> {
         tps_timed
     )
     .map_err(|e| e.to_string())?;
+    writeln!(f, "{}", if a.glance { "\t1" } else { "" }).map_err(|e| e.to_string())?;
     if let (Some(d), true) = (&ckdir, steps_run == steps) {
         let _ = fs::remove_dir_all(d); // the whole schedule ran and the result is written
     }
@@ -477,7 +504,7 @@ fn settings_line(a: &Args, steps: usize) -> String {
         a.clip,
         a.seed,
         a.data_seed
-    )
+    ) + if a.glance { " glance=1" } else { "" }
 }
 
 /// Write a checkpoint into `dir`: model-STEP and optim-STEP first, then state.txt (renamed into place, so

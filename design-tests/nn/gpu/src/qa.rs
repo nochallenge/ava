@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 /// Where the question-answer data lives (git-ignored, never published).
 pub const QA_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../data/qa");
 pub const ARC_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../data/ai2-arc/ARC-V1-Feb2018-2");
+/// OpenBookQA's main split (v40). Main/test.jsonl is SEALED: only the pre-registered call opens it.
+pub const OBQA_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../data/openbookqa/OpenBookQA-V1-Sep2018/Data/Main");
 
 /// The prompt Ava is taught with and asked with. The answer follows as " {answer}" and ends with EOS.
 pub fn prompt_text(context: &str, question: &str) -> String {
@@ -62,16 +64,35 @@ pub fn load_arc(path: &Path) -> Result<Vec<Mc>, String> {
     Ok(out)
 }
 
-/// The evaluation sets by name. `sciq-test` is the sealed set: it is opened once, by a pre-registered test.
+/// OpenBookQA jsonl (v40): {"id", "question": {"stem", "choices": [{"text", "label"}]}, "answerKey"}, the same
+/// shape as ARC, closed book (the "open book" of facts is not given).
+pub fn load_obqa(path: &Path) -> Result<Vec<Mc>, String> {
+    load_arc(path)
+}
+
+/// The evaluation sets by name. `sciq-test` (spent in v37) and `obqa-test` (v40) are sealed: each is opened once,
+/// by a pre-registered test. The `-train` sets are the training splits (v40's reward phase asks them).
 pub fn eval_set(name: &str) -> Result<Vec<Mc>, String> {
     let qa = PathBuf::from(QA_DIR);
     let arc = PathBuf::from(ARC_DIR);
+    let obqa = PathBuf::from(OBQA_DIR);
     match name {
         "sciq-dev" => load_sciq(&qa.join("sciq/valid.json")),
         "sciq-test" => load_sciq(&qa.join("sciq/sealed/test.json")),
+        "sciq-train" => load_sciq(&qa.join("sciq/train.json")),
         "arc-easy-dev" => load_arc(&arc.join("ARC-Easy/ARC-Easy-Dev.jsonl")),
         "arc-challenge-dev" => load_arc(&arc.join("ARC-Challenge/ARC-Challenge-Dev.jsonl")),
-        _ => Err(format!("unknown set {name:?} (sciq-dev, sciq-test, arc-easy-dev, arc-challenge-dev)")),
+        "arc-train" => {
+            let mut v = load_arc(&arc.join("ARC-Easy/ARC-Easy-Train.jsonl"))?;
+            v.extend(load_arc(&arc.join("ARC-Challenge/ARC-Challenge-Train.jsonl"))?);
+            Ok(v)
+        }
+        "obqa-dev" => load_obqa(&obqa.join("dev.jsonl")),
+        "obqa-test" => load_obqa(&obqa.join("test.jsonl")),
+        "obqa-train" => load_obqa(&obqa.join("train.jsonl")),
+        _ => Err(format!(
+            "unknown set {name:?} (sciq-dev, sciq-test, sciq-train, arc-easy-dev, arc-challenge-dev, arc-train, obqa-dev, obqa-test, obqa-train)"
+        )),
     }
 }
 
@@ -106,4 +127,27 @@ pub fn read_sft(path: &Path) -> Result<Vec<Example>, String> {
         out.push(Example { src, np, toks });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v40's question sets load with one right choice each (dev and train splits only; never obqa-test).
+    #[test]
+    fn obqa_arc_sciq_train_sets_load() {
+        for (name, n) in [("obqa-dev", 500), ("obqa-train", 4957)] {
+            let v = eval_set(name).unwrap();
+            assert_eq!(v.len(), n, "{name}");
+            assert!(v.iter().all(|q| q.choices.len() == 4 && q.right < 4 && !q.question.trim().is_empty()), "{name}");
+        }
+        let arc = eval_set("arc-train").unwrap();
+        let easy = load_arc(&PathBuf::from(ARC_DIR).join("ARC-Easy/ARC-Easy-Train.jsonl")).unwrap();
+        let ch = load_arc(&PathBuf::from(ARC_DIR).join("ARC-Challenge/ARC-Challenge-Train.jsonl")).unwrap();
+        assert_eq!(arc.len(), easy.len() + ch.len());
+        assert!(arc.iter().all(|q| q.right < q.choices.len()));
+        let sciq = eval_set("sciq-train").unwrap();
+        assert!(sciq.len() > 10_000 && sciq.iter().all(|q| q.right == 0 && q.choices.len() == 4));
+        assert!(eval_set("nope").is_err());
+    }
 }

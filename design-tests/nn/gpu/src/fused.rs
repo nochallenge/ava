@@ -406,6 +406,53 @@ pub fn embed_bwd_add(base: &Tensor, ids: &Tensor, dx: &Tensor) -> Result<Tensor>
     Ok(Tensor::from_storage(Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev)), (v, d), BackpropOp::none(), false))
 }
 
+/// v39 glance, backward of the place embedding: d place[p] = sum of dx over the tokens whose place is p, for the
+/// `places` real rows (p < places); tokens of place `places` ("none", most of them) are dropped. On CUDA the
+/// embed_bwd kernel runs with only the real rows, so no block sums the "none" tokens (one block used to add up
+/// ~95% of dx for a row that was thrown away); each real row's sum is in the same order as before, so the result
+/// is bit-identical to `embed_bwd_add` on places + 1 rows narrowed to the first `places`.
+pub fn place_bwd(pid: &Tensor, dx: &Tensor, places: usize) -> Result<Tensor> {
+    let d = dx.dim(D::Minus1)?;
+    let n = pid.elem_count();
+    if dx.device().is_cuda() && n <= EMBED_MAX_ROWS {
+        return embed_bwd_add(&Tensor::zeros((places, d), DType::F32, dx.device())?, pid, dx);
+    }
+    embed_bwd_add(&Tensor::zeros((places + 1, d), DType::F32, dx.device())?, pid, dx)?.narrow(0, 0, places)?.contiguous()
+}
+
+/// v39 glance: the place of every token of `ids` [B, T] (u32), as [B·T] u32: 0 = units, 1 = tens, ...,
+/// 16 = none (the rule of ava_data::numbers::place_ids, applied per row; one CUDA thread per token, or that
+/// function itself on the CPU).
+pub fn place_ids(ids: &Tensor) -> Result<Tensor> {
+    let (b, t) = ids.dims2()?;
+    let n = b * t;
+    if n == 0 || !ids.device().is_cuda() {
+        let v: Vec<u32> = ids.flatten_all()?.to_vec1()?;
+        let mut out = Vec::with_capacity(n);
+        for row in v.chunks(t.max(1)) {
+            out.extend(ava_data::numbers::place_ids(row));
+        }
+        return Tensor::from_vec(out, n, ids.device());
+    }
+    let ids = ids.contiguous()?;
+    let (is, il) = ids.storage_and_layout();
+    let Storage::Cuda(is) = &*is else {
+        candle_core::bail!("place_ids: CUDA only");
+    };
+    let dev = is.device().clone();
+    let ids_v = match il.contiguous_offsets() {
+        Some((a, b)) => is.as_cuda_slice::<u32>()?.slice(a..b),
+        None => candle_core::bail!("place_ids: ids must be contiguous"),
+    };
+    let out = unsafe { dev.alloc::<u32>(n.max(1))? };
+    let func = dev.get_or_load_custom_func("place_ids", MODULE, PTX)?;
+    let (ni, ti) = (n as i32, t as i32);
+    let mut lb = func.builder();
+    lb.arg(&ids_v).arg(&out).arg(&ni).arg(&ti);
+    unsafe { lb.launch(elems_cfg(n.max(1))) }.w()?;
+    Ok(Tensor::from_storage(Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev)), n, BackpropOp::none(), false))
+}
+
 /// tok[ids] with a backward through embed_bwd_add (the T path's embedding; autograd).
 pub fn embedding(tok: &Tensor, ids: &Tensor) -> Result<Tensor> {
     tok.contiguous()?.apply_op2(&ids.flatten_all()?.contiguous()?, Embed)
@@ -1101,6 +1148,11 @@ pub const HEBB_CK: usize = 16;
 /// head-normed and times silu(g); ck holds the state every HEBB_CK steps for hebb_bwd_raw. The same maths as model.rs
 /// hebb() for D, without autograd.
 pub fn hebb_fwd_per_token(p: &Tensor, cst: &Tensor, b: usize, t: usize, nh: usize, eps: f64) -> Result<(Tensor, Tensor)> {
+    hebb_fwd_pt(p, cst, b, t, nh, eps, false)
+}
+
+/// v40: hebb_fwd_per_token with O as f32, or as bf16 if `bf` (hebb_fwd_b: f2bf of the same values).
+fn hebb_fwd_pt(p: &Tensor, cst: &Tensor, b: usize, t: usize, nh: usize, eps: f64, bf: bool) -> Result<(Tensor, Tensor)> {
     let (p, cst) = (p.contiguous()?, cst.contiguous()?);
     let d = nh * ATTN_HS;
     let ld = 4 * d + 2 * nh;
@@ -1115,14 +1167,16 @@ pub fn hebb_fwd_per_token(p: &Tensor, cst: &Tensor, b: usize, t: usize, nh: usiz
     let dev = ps.device().clone();
     let (pv, cv) = (view(ps, pl, "hebb p")?, view(cs, cl, "hebb cst")?);
     let nck = t.div_ceil(HEBB_CK);
-    let o = unsafe { dev.alloc::<f32>(b * t * d)? };
+    let o = OutBuf::alloc(&dev, b * t * d, bf)?;
     let ck = unsafe { dev.alloc::<f32>(b * nh * nck * ATTN_HS * ATTN_HS)? };
-    let func = dev.get_or_load_custom_func("hebb_fwd", MODULE, PTX)?;
+    let func = dev.get_or_load_custom_func(if bf { "hebb_fwd_b" } else { "hebb_fwd" }, MODULE, PTX)?;
     let (bi, hi, ti, ldi, e) = (b as i32, nh as i32, t as i32, ld as i32, eps as f32);
     let mut lb = func.builder();
-    lb.arg(&pv).arg(&cv).arg(&o).arg(&ck).arg(&bi).arg(&hi).arg(&ti).arg(&ldi).arg(&e);
+    lb.arg(&pv).arg(&cv);
+    o.push(&mut lb);
+    lb.arg(&ck).arg(&bi).arg(&hi).arg(&ti).arg(&ldi).arg(&e);
     unsafe { lb.launch(delta_cfg(b * nh)) }.w()?;
-    let ot = Tensor::from_storage(Storage::Cuda(CudaStorage::wrap_cuda_slice(o, dev.clone())), (b * t, d), BackpropOp::none(), false);
+    let ot = o.tensor(dev.clone(), (b * t, d));
     let ckt = Tensor::from_storage(Storage::Cuda(CudaStorage::wrap_cuda_slice(ck, dev)), (b * nh * nck, ATTN_HS * ATTN_HS), BackpropOp::none(), false);
     Ok((ot, ckt))
 }
@@ -1131,6 +1185,19 @@ pub fn hebb_fwd_per_token(p: &Tensor, cst: &Tensor, b: usize, t: usize, nh: usiz
 /// recomputed from its saved state into a per-head scratch ([B·H, HEBB_CK, 32, 32] f32, freed on return), then walked
 /// back through. Gradients of ba and bb are the column sums of dP's za and zb parts.
 pub fn hebb_bwd_per_token(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b: usize, t: usize, nh: usize, eps: f64) -> Result<Tensor> {
+    hebb_bwd_per_token_k(p, cst, ck, d_o, b, t, nh, eps, hebb_bwd_w1_on())
+}
+
+/// v40: hebb_bwd_per_token with the kernel chosen: hebb_bwd_w1 (one head per block) if `w1`, else hebb_bwd.
+#[allow(clippy::too_many_arguments)]
+pub fn hebb_bwd_per_token_k(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b: usize, t: usize, nh: usize, eps: f64, w1: bool) -> Result<Tensor> {
+    Ok(hebb_bwd_pt(p, cst, ck, d_o, b, t, nh, eps, w1, false)?.0)
+}
+
+/// v40: hebb_bwd_per_token_k with dP as f32 (dz None), or if `bf` as bf16 (f2bf of the same values) with dza, dzb
+/// in f32 apart (dz [N, 2H]).
+#[allow(clippy::too_many_arguments)]
+fn hebb_bwd_pt(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b: usize, t: usize, nh: usize, eps: f64, w1: bool, bf: bool) -> Result<(Tensor, Option<Tensor>)> {
     let (p, cst, ck, d_o) = (p.contiguous()?, cst.contiguous()?, ck.contiguous()?, d_o.contiguous()?);
     let d = nh * ATTN_HS;
     let ld = 4 * d + 2 * nh;
@@ -1147,13 +1214,33 @@ pub fn hebb_bwd_per_token(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b
     let dev = ps.device().clone();
     let (pv, cv, kv, dv) = (view(ps, pl, "hebb p")?, view(cs, cl, "hebb cst")?, view(ks, kl, "hebb ck")?, view(ds, dl, "hebb dO")?);
     let scratch = unsafe { dev.alloc::<f32>(b * nh * HEBB_CK * ATTN_HS * ATTN_HS)? };
-    let dp = unsafe { dev.alloc::<f32>(b * t * ld)? };
+    let dp = OutBuf::alloc(&dev, b * t * ld, bf)?;
+    let dz = if bf { Some(unsafe { dev.alloc::<f32>(b * t * 2 * nh)? }) } else { None };
     let (bi, hi, ti, ldi, e) = (b as i32, nh as i32, t as i32, ld as i32, eps as f32);
-    let fb = dev.get_or_load_custom_func("hebb_bwd", MODULE, PTX)?;
+    // v40: one head per block (hebb_bwd_w1, the same code per head): no second wave of 4 heads at b·nh = 384
+    let name = match (w1, bf) {
+        (true, false) => "hebb_bwd_w1",
+        (false, false) => "hebb_bwd",
+        (true, true) => "hebb_bwd_w1_bf",
+        (false, true) => "hebb_bwd_bf",
+    };
+    let fb = dev.get_or_load_custom_func(name, MODULE, PTX)?;
     let mut lb = fb.builder();
-    lb.arg(&pv).arg(&cv).arg(&kv).arg(&scratch).arg(&dv).arg(&dp).arg(&bi).arg(&hi).arg(&ti).arg(&ldi).arg(&e);
-    unsafe { lb.launch(delta_cfg(b * nh)) }.w()?;
-    Ok(Tensor::from_storage(Storage::Cuda(CudaStorage::wrap_cuda_slice(dp, dev)), (b * t, ld), BackpropOp::none(), false))
+    lb.arg(&pv).arg(&cv).arg(&kv).arg(&scratch).arg(&dv);
+    dp.push(&mut lb);
+    if let Some(z) = &dz {
+        lb.arg(z);
+    }
+    lb.arg(&bi).arg(&hi).arg(&ti).arg(&ldi).arg(&e);
+    unsafe { lb.launch(if w1 { one_warp(b * nh) } else { delta_cfg(b * nh) }) }.w()?;
+    let dzt = dz.map(|z| Tensor::from_storage(Storage::Cuda(CudaStorage::wrap_cuda_slice(z, dev.clone())), (b * t, 2 * nh), BackpropOp::none(), false));
+    Ok((dp.tensor(dev, (b * t, ld)), dzt))
+}
+
+/// v40: hebb_bwd_per_token launches hebb_bwd_w1 (one head per block of 32 threads) unless AVA_HEBB_W1=0 (read once).
+pub fn hebb_bwd_w1_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("AVA_HEBB_W1").is_ok_and(|v| v == "0"))
 }
 
 /// D's fast-weight block forward (see hebb_fwd_per_token): the chunk form or the per-token kernel, by hebb_use_chunk.
@@ -1171,6 +1258,65 @@ pub fn hebb_bwd_raw(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b: usiz
         hebc_bwd_raw(p, cst, ck, d_o, b, t, nh, eps)
     } else {
         hebb_bwd_per_token(p, cst, ck, d_o, b, t, nh, eps)
+    }
+}
+
+/// v40: hebb_fwd_raw with O written as bf16 (the matmul operand of the bf16 training step): f2bf of the values
+/// hebb_fwd_raw gives, without the f32 O and its cast. Chunk form or per-token kernel as hebb_fwd_raw.
+pub fn hebb_fwd_raw_b(p: &Tensor, cst: &Tensor, b: usize, t: usize, nh: usize, eps: f64) -> Result<(Tensor, Tensor)> {
+    if hebb_use_chunk(p.device(), b, nh)? {
+        hebc_fwd(p, cst, b, t, nh, eps, true)
+    } else {
+        hebb_fwd_pt(p, cst, b, t, nh, eps, true)
+    }
+}
+
+/// v40: hebb_bwd_raw with dP written as bf16 (the matmul operand; f2bf of the values hebb_bwd_raw gives) and its
+/// za, zb columns also as f32, dz [N, 2H] (dz[:, ..H] = dP[:, 4d..4d+H], dz[:, H..] = dP[:, 4d+H..]), for the bias
+/// gradients. Returns (dP bf16, dz).
+pub fn hebb_bwd_raw_b(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b: usize, t: usize, nh: usize, eps: f64) -> Result<(Tensor, Tensor)> {
+    let (dp, dz) = if hebb_use_chunk(p.device(), b, nh)? {
+        hebc_bwd(p, cst, ck, d_o, b, t, nh, eps, true)?
+    } else {
+        hebb_bwd_pt(p, cst, ck, d_o, b, t, nh, eps, hebb_bwd_w1_on(), true)?
+    };
+    Ok((dp, dz.expect("bf16 dP comes with dz")))
+}
+
+/// v40: the per-token kernel of hebb_bwd_raw_b, with the kernel chosen as in hebb_bwd_per_token_k (for tests).
+#[allow(clippy::too_many_arguments)]
+pub fn hebb_bwd_per_token_b(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b: usize, t: usize, nh: usize, eps: f64, w1: bool) -> Result<(Tensor, Tensor)> {
+    let (dp, dz) = hebb_bwd_pt(p, cst, ck, d_o, b, t, nh, eps, w1, true)?;
+    Ok((dp, dz.expect("bf16 dP comes with dz")))
+}
+
+/// v40: an output buffer a kernel writes as f32 or as bf16.
+enum OutBuf {
+    F(candle_core::cuda_backend::cudarc::driver::CudaSlice<f32>),
+    B(candle_core::cuda_backend::cudarc::driver::CudaSlice<half::bf16>),
+}
+
+impl OutBuf {
+    fn alloc(dev: &CudaDevice, n: usize, bf: bool) -> Result<OutBuf> {
+        Ok(if bf { OutBuf::B(unsafe { dev.alloc::<half::bf16>(n)? }) } else { OutBuf::F(unsafe { dev.alloc::<f32>(n)? }) })
+    }
+
+    fn push<'a>(&'a self, lb: &mut candle_core::cuda_backend::cudarc::driver::LaunchArgs<'a>) {
+        match self {
+            OutBuf::F(s) => {
+                lb.arg(s);
+            }
+            OutBuf::B(s) => {
+                lb.arg(s);
+            }
+        }
+    }
+
+    fn tensor<S: Into<Shape>>(self, dev: CudaDevice, shape: S) -> Tensor {
+        match self {
+            OutBuf::F(s) => Tensor::from_storage(Storage::Cuda(CudaStorage::wrap_cuda_slice(s, dev)), shape, BackpropOp::none(), false),
+            OutBuf::B(s) => wrap_bf16(s, dev, &shape.into()),
+        }
     }
 }
 
@@ -1231,6 +1377,11 @@ fn per_head(heads: usize) -> LaunchConfig {
 /// v38: hebb_fwd_raw in the chunk form of the gated delta rule (lif.cu hc_prep, hc_scan, hc_out): the same inputs and
 /// outputs, the same maths to rounding, and ck is the same tensor (the state entering every 16-token chunk).
 pub fn hebc_fwd_raw(p: &Tensor, cst: &Tensor, b: usize, t: usize, nh: usize, eps: f64) -> Result<(Tensor, Tensor)> {
+    hebc_fwd(p, cst, b, t, nh, eps, false)
+}
+
+/// v40: hebc_fwd_raw with O as f32, or as bf16 if `bf` (hc_out_b: f2bf of the same values).
+fn hebc_fwd(p: &Tensor, cst: &Tensor, b: usize, t: usize, nh: usize, eps: f64, bf: bool) -> Result<(Tensor, Tensor)> {
     let (p, cst) = (p.contiguous()?, cst.contiguous()?);
     let d = nh * ATTN_HS;
     let ld = 4 * d + 2 * nh;
@@ -1266,19 +1417,28 @@ pub fn hebc_fwd_raw(p: &Tensor, cst: &Tensor, b: usize, t: usize, nh: usize, eps
     unsafe { lb.launch(per_head(b * nh)) }.w()?;
     hc_prof(&dev, "hc_scan")?;
     drop((u, w, kd, gc));
-    let o = unsafe { dev.alloc::<f32>(b * t * d)? };
-    let fo = dev.get_or_load_custom_func("hc_out", MODULE, PTX)?;
+    let o = OutBuf::alloc(&dev, b * t * d, bf)?;
+    let fo = dev.get_or_load_custom_func(if bf { "hc_out_b" } else { "hc_out" }, MODULE, PTX)?;
     let mut lb = fo.builder();
-    lb.arg(&pv).arg(&cv).arg(&dl).arg(&ck).arg(&o).arg(&bi).arg(&hi).arg(&ti).arg(&ldi).arg(&e);
+    lb.arg(&pv).arg(&cv).arg(&dl).arg(&ck);
+    o.push(&mut lb);
+    lb.arg(&bi).arg(&hi).arg(&ti).arg(&ldi).arg(&e);
     unsafe { lb.launch(one_warp(nchunks)) }.w()?;
     hc_prof(&dev, "hc_out")?;
-    let ot = Tensor::from_storage(Storage::Cuda(CudaStorage::wrap_cuda_slice(o, dev.clone())), (b * t, d), BackpropOp::none(), false);
+    let ot = o.tensor(dev.clone(), (b * t, d));
     let ckt = Tensor::from_storage(Storage::Cuda(CudaStorage::wrap_cuda_slice(ck, dev)), (nchunks, ATTN_HS * ATTN_HS), BackpropOp::none(), false);
     Ok((ot, ckt))
 }
 
 /// v38: hebb_bwd_raw in the chunk form (lif.cu hc_bout, hc_bscan, hc_bmain). Takes ck from either forward.
 pub fn hebc_bwd_raw(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b: usize, t: usize, nh: usize, eps: f64) -> Result<Tensor> {
+    Ok(hebc_bwd(p, cst, ck, d_o, b, t, nh, eps, false)?.0)
+}
+
+/// v40: hebc_bwd_raw with dP as f32 (dz None), or if `bf` as bf16 (hc_bout_b, hc_bmain_b: f2bf of the same values)
+/// with dza, dzb in f32 apart (dz [N, 2H]).
+#[allow(clippy::too_many_arguments)]
+fn hebc_bwd(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b: usize, t: usize, nh: usize, eps: f64, bf: bool) -> Result<(Tensor, Option<Tensor>)> {
     let (p, cst, ck, d_o) = (p.contiguous()?, cst.contiguous()?, ck.contiguous()?, d_o.contiguous()?);
     let d = nh * ATTN_HS;
     let ld = 4 * d + 2 * nh;
@@ -1304,10 +1464,13 @@ pub fn hebc_bwd_raw(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b: usiz
     let dy = unsafe { dev.alloc::<f32>(tile)? };
     let x1 = unsafe { dev.alloc::<f32>(tile)? };
     let x2 = unsafe { dev.alloc::<f32>(nchunks * ATTN_HS * ATTN_HS)? };
-    let dp = unsafe { dev.alloc::<f32>(b * t * ld)? };
-    let f1 = dev.get_or_load_custom_func("hc_bout", MODULE, PTX)?;
+    let dp = OutBuf::alloc(&dev, b * t * ld, bf)?;
+    let dz = if bf { Some(unsafe { dev.alloc::<f32>(b * t * 2 * nh)? }) } else { None };
+    let f1 = dev.get_or_load_custom_func(if bf { "hc_bout_b" } else { "hc_bout" }, MODULE, PTX)?;
     let mut lb = f1.builder();
-    lb.arg(&pv).arg(&cv).arg(&kv).arg(&dv).arg(&w).arg(&kd).arg(&gc).arg(&dp).arg(&dy).arg(&x1).arg(&x2).arg(&bi).arg(&hi).arg(&ti).arg(&ldi).arg(&e);
+    lb.arg(&pv).arg(&cv).arg(&kv).arg(&dv).arg(&w).arg(&kd).arg(&gc);
+    dp.push(&mut lb);
+    lb.arg(&dy).arg(&x1).arg(&x2).arg(&bi).arg(&hi).arg(&ti).arg(&ldi).arg(&e);
     hc_prof(&dev, "start")?;
     unsafe { lb.launch(one_warp(nchunks)) }.w()?;
     hc_prof(&dev, "hc_bout")?;
@@ -1319,12 +1482,138 @@ pub fn hebc_bwd_raw(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b: usiz
     unsafe { lb.launch(per_head(b * nh)) }.w()?;
     hc_prof(&dev, "hc_bscan")?;
     drop((w, kd, gc, x1, x2));
-    let f3 = dev.get_or_load_custom_func("hc_bmain", MODULE, PTX)?;
+    let f3 = dev.get_or_load_custom_func(if bf { "hc_bmain_b" } else { "hc_bmain" }, MODULE, PTX)?;
     let mut lb = f3.builder();
-    lb.arg(&pv).arg(&cv).arg(&kv).arg(&dfn).arg(&dd).arg(&dy).arg(&dp).arg(&bi).arg(&hi).arg(&ti).arg(&ldi);
+    lb.arg(&pv).arg(&cv).arg(&kv).arg(&dfn).arg(&dd).arg(&dy);
+    dp.push(&mut lb);
+    if let Some(z) = &dz {
+        lb.arg(z);
+    }
+    lb.arg(&bi).arg(&hi).arg(&ti).arg(&ldi);
     unsafe { lb.launch(one_warp(nchunks)) }.w()?;
     hc_prof(&dev, "hc_bmain")?;
-    Ok(Tensor::from_storage(Storage::Cuda(CudaStorage::wrap_cuda_slice(dp, dev)), (b * t, ld), BackpropOp::none(), false))
+    let dzt = dz.map(|z| Tensor::from_storage(Storage::Cuda(CudaStorage::wrap_cuda_slice(z, dev.clone())), (b * t, 2 * nh), BackpropOp::none(), false));
+    Ok((dp.tensor(dev, (b * t, ld)), dzt))
+}
+
+/// v40: raw device pointer of a contiguous f32 tensor's data (the tensor must outlive every use of the pointer).
+fn f32_ptr(t: &Tensor, what: &str) -> Result<u64> {
+    use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+    if t.dtype() != DType::F32 {
+        candle_core::bail!("{what}: f32 expected, got {:?}", t.dtype());
+    }
+    let (s, l) = t.storage_and_layout();
+    let Storage::Cuda(s) = &*s else {
+        candle_core::bail!("{what}: CUDA only");
+    };
+    let v = view(s, l, what)?;
+    let stream = s.device().cuda_stream();
+    let (p, _g) = v.device_ptr(&stream);
+    Ok(p)
+}
+
+/// v40: sqrt(sum over `gs` of sum(g^2)) as an f64 scalar on the device, in three launches: the same value, bit for
+/// bit, as AdamW::grad_norm_t's per-tensor candle ops (sqr, sum_keepdim(-1), sum_all, the f32 sums added in order,
+/// to f64, sqrt): lif.cu gn_rows / gn_final reproduce candle's reduction grouping exactly. f32 CUDA tensors.
+pub fn grad_norm_multi(gs: &[Tensor]) -> Result<Tensor> {
+    if gs.is_empty() {
+        candle_core::bail!("grad_norm_multi: no tensors");
+    }
+    let gs: Vec<Tensor> = gs.iter().map(|g| g.contiguous()).collect::<Result<_>>()?;
+    let candle_core::Device::Cuda(dev) = gs[0].device().clone() else {
+        candle_core::bail!("grad_norm_multi: CUDA only");
+    };
+    let mut tab: Vec<u64> = Vec::with_capacity(4 * gs.len());
+    let mut nrows = 0usize;
+    for g in &gs {
+        let n = g.elem_count();
+        let cols = if g.rank() >= 2 { g.dim(D::Minus1)? } else { n };
+        let rows = if cols == 0 { 0 } else { n / cols };
+        if rows == 0 {
+            candle_core::bail!("grad_norm_multi: empty tensor {:?}", g.dims());
+        }
+        tab.extend_from_slice(&[f32_ptr(g, "grad_norm_multi")?, rows as u64, cols as u64, nrows as u64]);
+        nrows += rows;
+    }
+    let nt = gs.len();
+    let tab_d = dev.clone_htod(&tab)?;
+    let rs = unsafe { dev.alloc::<f32>(nrows + nt)? };
+    let out = unsafe { dev.alloc::<f64>(1)? };
+    let (nti, nri) = (nt as i32, nrows as i32);
+    {
+        let rv = rs.slice(0..nrows);
+        let f = dev.get_or_load_custom_func("gn_rows", MODULE, PTX)?;
+        let mut lb = f.builder();
+        lb.arg(&tab_d).arg(&nti).arg(&nri).arg(&rv);
+        let cfg = LaunchConfig { grid_dim: ((nrows as u32).div_ceil(8), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        unsafe { lb.launch(cfg) }.w()?;
+    }
+    {
+        let (rv, tv) = (rs.slice(0..nrows), rs.slice(nrows..nrows + nt));
+        let f = dev.get_or_load_custom_func("gn_final", MODULE, PTX)?;
+        let mut lb = f.builder();
+        lb.arg(&tab_d).arg(&nti).arg(&rv).arg(&tv).arg(&out);
+        unsafe { lb.launch(LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 }) }.w()?;
+    }
+    drop(gs);
+    Ok(Tensor::from_storage(Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev)), (), BackpropOp::none(), false))
+}
+
+/// v40: adamw_in_place_s for many parameters in one launch (lif.cu adamw_multi): element for element the same
+/// arithmetic, so the same bits. `shrink[i]` is parameter i's decay factor; sc.shrink and sc.grad_scale are unused.
+/// Each w, m, v must be a parameter's own contiguous storage (as for adamw_in_place).
+pub fn adamw_multi(w: &[Tensor], g: &[Tensor], m: &[Tensor], v: &[Tensor], shrink: &[f64], scale: &Tensor, sc: &AdamWScalars) -> Result<()> {
+    let nt = w.len();
+    if nt == 0 {
+        return Ok(());
+    }
+    if g.len() != nt || m.len() != nt || v.len() != nt || shrink.len() != nt {
+        candle_core::bail!("adamw_multi: lists of different lengths");
+    }
+    if scale.dtype() != DType::F64 || scale.elem_count() != 1 {
+        candle_core::bail!("adamw_multi: scale must be one f64");
+    }
+    const THREADS: usize = 256;
+    let gc: Vec<Tensor> = g.iter().map(|x| x.contiguous()).collect::<Result<_>>()?;
+    let mut tab: Vec<u64> = Vec::with_capacity(6 * nt);
+    let mut blocks = 0usize;
+    for i in 0..nt {
+        let n = w[i].elem_count();
+        if !(w[i].is_contiguous() && m[i].is_contiguous() && v[i].is_contiguous()) || m[i].elem_count() != n || v[i].elem_count() != n || gc[i].elem_count() != n {
+            candle_core::bail!("adamw_multi: w, m, v must be contiguous and of one size");
+        }
+        let sh = (shrink[i] as f32).to_bits() as u64;
+        tab.extend_from_slice(&[
+            f32_ptr(&w[i], "adamw_multi w")?,
+            f32_ptr(&gc[i], "adamw_multi g")?,
+            f32_ptr(&m[i], "adamw_multi m")?,
+            f32_ptr(&v[i], "adamw_multi v")?,
+            n as u64,
+            (blocks as u64) | (sh << 32),
+        ]);
+        blocks += n.div_ceil(THREADS);
+    }
+    if blocks >= u32::MAX as usize {
+        candle_core::bail!("adamw_multi: too many elements");
+    }
+    let scale = scale.contiguous()?;
+    let (ss, sl) = scale.storage_and_layout();
+    let Storage::Cuda(ss) = &*ss else {
+        candle_core::bail!("adamw_multi: CUDA only");
+    };
+    let dev = ss.device().clone();
+    let sv = ss.as_cuda_slice::<f64>()?.slice(sl.start_offset()..sl.start_offset() + 1);
+    let tab_d = dev.clone_htod(&tab)?;
+    let f = dev.get_or_load_custom_func("adamw_multi", MODULE, PTX)?;
+    let nti = nt as i32;
+    let fl = |x: f64| x as f32;
+    let (b1, c1, b2, c2) = (fl(sc.b1), fl(1.0 - sc.b1), fl(sc.b2), fl(1.0 - sc.b2));
+    let (eps, step, ibc2) = (fl(sc.eps), fl(sc.step_size), fl(sc.inv_sqrt_bc2));
+    let mut lb = f.builder();
+    lb.arg(&tab_d).arg(&nti).arg(&sv).arg(&b1).arg(&c1).arg(&b2).arg(&c2).arg(&eps).arg(&step).arg(&ibc2);
+    unsafe { lb.launch(LaunchConfig { grid_dim: (blocks as u32, 1, 1), block_dim: (THREADS as u32, 1, 1), shared_mem_bytes: 0 }) }.w()?;
+    drop(gc);
+    Ok(())
 }
 
 /// Speed round 13: adamw without the [3, n] result and the three copies back: the kernel overwrites w, m and v where
@@ -1390,4 +1679,37 @@ pub fn adamw_in_place_s(w: &Tensor, g: &Tensor, m: &Tensor, v: &Tensor, scale: &
     lb.arg(&b1).arg(&c1).arg(&b2).arg(&c2).arg(&eps).arg(&step).arg(&ibc2).arg(&shrink);
     unsafe { lb.launch(elems_cfg(n)) }.w()?;
     Ok(())
+}
+
+/// v40: the magnitude code of every token of `ids` [B, T] (u32), as [B·T, MAG_F] f32 (src/mag.rs; one CUDA thread
+/// per token, or that rule itself on the CPU).
+pub fn mag_feats(ids: &Tensor) -> Result<Tensor> {
+    use crate::mag::{feats_row, MAG_F};
+    let (b, t) = ids.dims2()?;
+    let n = b * t;
+    if n == 0 || !ids.device().is_cuda() {
+        let v: Vec<u32> = ids.flatten_all()?.to_vec1()?;
+        let mut out = Vec::with_capacity(n * MAG_F);
+        for row in v.chunks(t.max(1)) {
+            out.extend(feats_row(row));
+        }
+        return Tensor::from_vec(out, (n, MAG_F), ids.device());
+    }
+    let ids = ids.contiguous()?;
+    let (is, il) = ids.storage_and_layout();
+    let Storage::Cuda(is) = &*is else {
+        candle_core::bail!("mag_feats: CUDA only");
+    };
+    let dev = is.device().clone();
+    let ids_v = match il.contiguous_offsets() {
+        Some((a, b)) => is.as_cuda_slice::<u32>()?.slice(a..b),
+        None => candle_core::bail!("mag_feats: ids must be contiguous"),
+    };
+    let out = unsafe { dev.alloc::<f32>(n * MAG_F)? };
+    let func = dev.get_or_load_custom_func("mag_feats", MODULE, PTX)?;
+    let (ni, ti) = (n as i32, t as i32);
+    let mut lb = func.builder();
+    lb.arg(&ids_v).arg(&out).arg(&ni).arg(&ti);
+    unsafe { lb.launch(elems_cfg(n)) }.w()?;
+    Ok(Tensor::from_storage(Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev)), (n, MAG_F), BackpropOp::none(), false))
 }

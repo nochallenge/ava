@@ -58,6 +58,38 @@ pub struct Stream {
     /// A only: each attention block's keys and values so far, [nh, seen, hs] (None before the first token).
     kv: Vec<Option<(Tensor, Tensor)>>,
     pub seen: usize,
+    /// v39 glance: the length named by the last mark (0 = none) and the digits read since it.
+    place_len: u32,
+    place_idx: u32,
+    /// v40: the engram store, every token's key and value so far [nh, seen, hs] (None before the first token), and
+    /// the last 17 tokens (the magnitude code reads back to the length mark).
+    ekv: Option<(Tensor, Tensor)>,
+    hist: Vec<u32>,
+}
+
+impl Stream {
+    /// v39: the place of `tok` given the tokens fed before it (the rule of ava_data::numbers::place_ids over the
+    /// whole history), and the state updated for the next token. 16 = none.
+    pub fn next_place(&mut self, tok: u32) -> u32 {
+        use ava_data::numbers::{is_digit, MARK_BASE, N_MARKS, PLACE_NONE};
+        if (MARK_BASE..MARK_BASE + N_MARKS).contains(&tok) {
+            self.place_len = tok - MARK_BASE + 1;
+            self.place_idx = 0;
+            PLACE_NONE
+        } else if is_digit(tok) {
+            let (l, k) = (self.place_len, self.place_idx);
+            self.place_idx = self.place_idx.saturating_add(1);
+            if (1..=15).contains(&l) && k < l {
+                l - 1 - k
+            } else {
+                PLACE_NONE
+            }
+        } else {
+            self.place_len = 0;
+            self.place_idx = 0;
+            PLACE_NONE
+        }
+    }
 }
 
 /// logit(p) = ln(p / (1 - p)).
@@ -125,7 +157,24 @@ pub struct Config {
     pub d: usize,
     pub layers: usize,
     pub ctx: usize,
+    /// v39, D only: the glance. The vocabulary holds the 16 length marks (ids 4096..4111, see
+    /// ava_data::numbers) and every digit adds a learned place embedding, `place_emb` [16, d], to its token
+    /// embedding (place = run length − 1 − index, read from the mark before the run; 16 = none, which adds 0).
+    pub glance: bool,
+    /// v40, D with the glance only: the magnitude code ("how much", src/mag.rs). Every number token adds its code
+    /// times `mag_w` [MAG_F, d] (starts at 0) to its embedding.
+    pub mag: bool,
+    /// v40, D only: the engram memory (hippocampus) in block i: after its fast-weight memory, an attention read over
+    /// a store of every token read so far (keys, values and queries from the block's normed input), its output
+    /// projection starting at 0 so the model starts exactly as without it.
+    pub engram: Option<usize>,
 }
+
+/// v39: the place embedding's rows (units, tens, ... up to 15 digits), and its tensor name.
+pub const PLACES: usize = 16;
+pub const PLACE_EMB: &str = "place_emb";
+/// v40: the magnitude code's weight name.
+pub const MAG_W: &str = "mag_w";
 
 impl Config {
     /// An S (Ava) config.
@@ -134,14 +183,46 @@ impl Config {
     }
 
     pub fn with_kind(kind: Kind, vocab: usize, d: usize, layers: usize, ctx: usize) -> Config {
-        let c = Config { kind, vocab, d, layers, ctx };
+        let c = Config { kind, vocab, d, layers, ctx, glance: false, mag: false, engram: None };
         c.validate().unwrap_or_else(|e| panic!("bad model config: {e}"));
         c
+    }
+
+    /// v39: this config with the glance on (D only, vocabulary 4112).
+    pub fn with_glance(self) -> std::result::Result<Config, String> {
+        let c = Config { glance: true, ..self };
+        c.validate()?;
+        Ok(c)
+    }
+
+    /// v40: this config with the magnitude code on (needs the glance).
+    pub fn with_mag(self) -> std::result::Result<Config, String> {
+        let c = Config { mag: true, ..self };
+        c.validate()?;
+        Ok(c)
+    }
+
+    /// v40: this config with the engram memory in block `layer` (D only).
+    pub fn with_engram(self, layer: usize) -> std::result::Result<Config, String> {
+        let c = Config { engram: Some(layer), ..self };
+        c.validate()?;
+        Ok(c)
     }
 
     pub fn validate(&self) -> std::result::Result<(), String> {
         if self.vocab == 0 || self.d == 0 || self.layers == 0 || self.ctx == 0 {
             return Err(format!("vocab, d, layers and ctx must all be positive: {self:?}"));
+        }
+        if self.mag && !self.glance {
+            return Err(format!("the magnitude code needs the glance (its length marks): {self:?}"));
+        }
+        if let Some(e) = self.engram {
+            if self.kind != Kind::D || e >= self.layers {
+                return Err(format!("the engram memory needs model D and a block below {}: {self:?}", self.layers));
+            }
+        }
+        if self.glance && (self.kind != Kind::D || self.vocab != ava_data::numbers::VOCAB_GLANCE) {
+            return Err(format!("the glance needs model D and vocab {}: {self:?}", ava_data::numbers::VOCAB_GLANCE));
         }
         if self.kind.is_ava() && (MLP_MULT * self.d) % KWTA_DIV != 0 {
             return Err(format!("4d = {} must be divisible by {KWTA_DIV} for kWTA", MLP_MULT * self.d));
@@ -197,8 +278,10 @@ impl Config {
             }
             Kind::T => (self.layers * (d + 4 * d * d + mlp), self.ctx * d),
         };
-        let total = v * d + pos + layers_total + d;
-        (total, total - v * d - pos)
+        let place = if self.glance { PLACES * d } else { 0 } + if self.mag { crate::mag::MAG_F * d } else { 0 };
+        let engram = if self.engram.is_some() { d + 4 * d * d } else { 0 };
+        let total = v * d + pos + place + layers_total + engram + d;
+        (total, total - v * d - pos - place)
     }
 }
 
@@ -257,6 +340,8 @@ struct Block {
     mem: Option<SpikeMem>,
     attn: Option<Attn>,
     hebb: Option<Hebb>,
+    /// v40: the engram memory read (Config::engram), after the fast weights.
+    eng: Option<Attn>,
     mlp: Mlp,
 }
 
@@ -264,6 +349,13 @@ pub struct Model {
     pub cfg: Config,
     tok: Tensor,
     pos: Option<Tensor>,
+    /// v39 glance only: the place embedding [PLACES, d].
+    place: Option<Tensor>,
+    /// v40 only: the magnitude code's weights [MAG_F, d].
+    mag_w: Option<Tensor>,
+    /// v40 lesion switches (after training, as neuroscience switches an area off): the place code, the magnitude
+    /// code and the engram memory read add nothing while on.
+    lesion: std::cell::Cell<(bool, bool, bool)>,
     blocks: Vec<Block>,
     final_norm: Tensor,
     /// Whether forward computes the logged activity means (off on steps that are not logged: they never
@@ -616,6 +708,10 @@ impl Model {
         let randn = |std: f64| Init::Randn { mean: 0.0, stdev: std };
         let tok = vb.get_with_hints((v, d), TOK_EMB, randn(INIT_STD))?;
         let pos = if cfg.kind == Kind::T { Some(vb.get_with_hints((cfg.ctx, d), POS_EMB, randn(INIT_STD))?) } else { None };
+        // v39: starts at 0 (the glance adds nothing until she learns what a place means); no RNG draws.
+        let place = if cfg.glance { Some(vb.get_with_hints((PLACES, d), PLACE_EMB, Init::Const(0.0))?) } else { None };
+        // v40: starts at 0 as well (no RNG draws), so a model loaded from a v39 checkpoint starts exactly as it was.
+        let mag_w = if cfg.mag { Some(vb.get_with_hints((crate::mag::MAG_F, d), MAG_W, Init::Const(0.0))?) } else { None };
         let mut blocks = Vec::with_capacity(cfg.layers);
         for i in 0..cfg.layers {
             let mem = if cfg.kind.is_ava() {
@@ -675,10 +771,59 @@ impl Model {
                 w1: vl.get_with_hints((d, hid), "w1", randn(INIT_STD))?,
                 w2: vl.get_with_hints((hid, d), "w2", randn(rs))?,
             };
-            blocks.push(Block { mem, attn, hebb, mlp });
+            // v40: the engram read; its output projection starts at 0, so the block starts exactly as without it
+            let eng = if cfg.engram == Some(i) {
+                let ve = vb.pp(format!("b{i}.eng"));
+                Some(Attn {
+                    norm: ve.get_with_hints(d, "norm", Init::Const(1.0))?,
+                    wq: ve.get_with_hints((d, d), "wq", randn(INIT_STD))?,
+                    wk: ve.get_with_hints((d, d), "wk", randn(INIT_STD))?,
+                    wv: ve.get_with_hints((d, d), "wv", randn(INIT_STD))?,
+                    wo: ve.get_with_hints((d, d), "wo", Init::Const(0.0))?,
+                })
+            } else {
+                None
+            };
+            blocks.push(Block { mem, attn, hebb, eng, mlp });
         }
         let final_norm = vb.get_with_hints(d, "final.norm", Init::Const(1.0))?;
-        Ok(Model { cfg, tok, pos, blocks, final_norm, track: std::cell::Cell::new(true), infer: std::cell::Cell::new(false) })
+        Ok(Model {
+            cfg,
+            tok,
+            pos,
+            place,
+            mag_w,
+            lesion: std::cell::Cell::new((false, false, false)),
+            blocks,
+            final_norm,
+            track: std::cell::Cell::new(true),
+            infer: std::cell::Cell::new(false),
+        })
+    }
+
+    /// v39: the place lookup table [PLACES + 1, d]: the place embedding plus a zero row for "none" (16), so
+    /// non-digits get exactly 0 added. Built from the parameter (autograd flows into rows 0..16 only).
+    fn place_table(place: &Tensor) -> Result<Tensor> {
+        let d = place.dim(1)?;
+        Tensor::cat(&[place, &Tensor::zeros((1, d), DType::F32, place.device())?], 0)
+    }
+
+    /// v40 lesion study: switch off the place code, the magnitude code and/or the engram read (each then adds 0).
+    /// Default all on (false, false, false). Applies to forward, step and the training step.
+    pub fn set_lesion(&self, place: bool, mag: bool, engram: bool) {
+        self.lesion.set((place, mag, engram));
+    }
+
+    /// v40: the engram read for the normed input h [B·T, d]: causal attention over every earlier token's key and
+    /// value (heads of 32), then Wo. On CUDA this is the fused flash-style kernel (no T×T matrix, so whole books
+    /// fit; the mask is not used there); on the CPU candle's chain with the mask (the same maths).
+    fn engram_read(&self, h: &Tensor, e: &Attn, b: usize, t: usize) -> Result<Tensor> {
+        let mask = if crate::fast_path() && h.device().is_cuda() && HEAD_SIZE == crate::fused::ATTN_HS {
+            Tensor::zeros(1, DType::F32, h.device())?
+        } else {
+            causal_mask(t, h.device())?
+        };
+        attention(h, e, b, t, &mask)
     }
 
     /// Compute the logged activity means in forward (default on).
@@ -706,6 +851,16 @@ impl Model {
         let fast = crate::fast_path() && ids.device().is_cuda();
         // Speed round 5: same values; the backward scatters with one block per vocabulary row (bit-identical).
         let mut x = if fast { crate::fused::embedding(&self.tok, ids)? } else { self.tok.embedding(&ids.flatten_all()?)? }; // [N, d]
+        let (place_off, mag_off, eng_off) = self.lesion.get();
+        if let (Some(place), false) = (&self.place, place_off) {
+            // v39 glance: + the place embedding of each digit (0 for everything else)
+            let pid = crate::fused::place_ids(ids)?;
+            x = x.add(&Self::place_table(place)?.embedding(&pid)?)?;
+        }
+        if let (Some(mw), false) = (&self.mag_w, mag_off) {
+            // v40: + the magnitude code of each number token times mag_w (0 for everything else)
+            x = x.add(&crate::fused::mag_feats(ids)?.matmul(mw)?)?;
+        }
         if let Some(pos) = &self.pos {
             if t > self.cfg.ctx {
                 candle_core::bail!("sequence length {t} exceeds the position table ({})", self.cfg.ctx);
@@ -741,6 +896,11 @@ impl Model {
             if let (Some(a), Some(mask)) = (&blk.attn, &mask) {
                 let h = norm(&x, &a.norm)?;
                 x = x.add(&attention(&h, a, b, t, mask)?)?;
+            }
+            if let (Some(e), false) = (&blk.eng, eng_off) {
+                // v40: the engram read over every token so far
+                let h = norm(&x, &e.norm)?;
+                x = x.add(&self.engram_read(&h, e, b, t)?)?;
             }
             let l = &blk.mlp;
             let h = norm(&x, &l.norm)?;
@@ -785,7 +945,7 @@ impl Model {
         } else {
             None
         };
-        let mut st = Stream { beta: Vec::new(), v: Vec::new(), s: Vec::new(), fw: Vec::new(), gamma, kv: Vec::new(), seen: 0 };
+        let mut st = Stream { beta: Vec::new(), v: Vec::new(), s: Vec::new(), fw: Vec::new(), gamma, kv: Vec::new(), seen: 0, place_len: 0, place_idx: 0, ekv: None, hist: Vec::new() };
         for blk in &self.blocks {
             let m = blk.mem.as_ref().expect("Ava block has SpikeMem");
             st.beta.push(sigmoid(&m.beta)?.unsqueeze(0)?); // [1, d], the value lif_scan uses
@@ -807,6 +967,22 @@ impl Model {
     pub fn step(&self, st: &mut Stream, tok: u32) -> Result<Tensor> {
         let dev = self.tok.device();
         let mut x = self.tok.embedding(&Tensor::new(&[tok], dev)?)?; // [1, d]
+        let (place_off, mag_off, eng_off) = self.lesion.get();
+        let p = st.next_place(tok) as usize;
+        if let (Some(place), false) = (&self.place, place_off) {
+            x = x.add(&Self::place_table(place)?.narrow(0, p, 1)?)?;
+        }
+        st.hist.push(tok);
+        if st.hist.len() > 17 {
+            st.hist.remove(0);
+        }
+        if let (Some(mw), false) = (&self.mag_w, mag_off) {
+            // v40: the magnitude code of this token, read back over the history (the rule of src/mag.rs)
+            if let Some(m) = crate::mag::position(&st.hist, st.hist.len() - 1) {
+                let f = Tensor::from_vec(crate::mag::code(m).to_vec(), (1, crate::mag::MAG_F), dev)?;
+                x = x.add(&f.matmul(mw)?)?;
+            }
+        }
         for (i, blk) in self.blocks.iter().enumerate() {
             let m = blk.mem.as_ref().expect("S block has SpikeMem");
             let h = rmsnorm(&x, &m.norm)?;
@@ -866,6 +1042,24 @@ impl Model {
                 let o = candle_nn::ops::softmax(&sc, D::Minus1)?.matmul(&vc)?; // [nh, 1, hs]
                 x = x.add(&o.reshape((1, self.cfg.d))?.matmul(&a.wo)?)?;
                 st.kv[i] = Some((kc, vc));
+            }
+            if let Some(e) = &blk.eng {
+                // v40: the engram, every token's key and value kept (stored even while lesioned, so switching it
+                // back on mid-text reads the whole past; when lesioned it adds nothing)
+                let nh = self.cfg.heads();
+                let h = rmsnorm(&x, &e.norm)?;
+                let head = |w: &Tensor| -> Result<Tensor> { h.matmul(w)?.reshape((nh, 1, HEAD_SIZE)) };
+                let (q, k, v) = (head(&e.wq)?, head(&e.wk)?, head(&e.wv)?);
+                let (kc, vc) = match st.ekv.take() {
+                    None => (k, v),
+                    Some((kp, vp)) => (Tensor::cat(&[&kp, &k], 1)?, Tensor::cat(&[&vp, &v], 1)?),
+                };
+                if !eng_off {
+                    let sc = q.matmul(&kc.t()?.contiguous()?)?.affine(1.0 / (HEAD_SIZE as f64).sqrt(), 0.0)?;
+                    let o = candle_nn::ops::softmax(&sc, D::Minus1)?.matmul(&vc)?;
+                    x = x.add(&o.reshape((1, self.cfg.d))?.matmul(&e.wo)?)?;
+                }
+                st.ekv = Some((kc, vc));
             }
             let l = &blk.mlp;
             let h = rmsnorm(&x, &l.norm)?;
@@ -1257,6 +1451,13 @@ impl Model {
     /// question tokens and padding). The loss is the weighted mean, sum(w·loss) / sum(w), and each row's gradient
     /// scale is w / sum(w). `wt = None` is the plain mean over every target, with the same ops as before.
     pub fn loss_and_grads_a_w(&self, ids: &Tensor, targets: &Tensor, wt: Option<&Tensor>, mm: &Mm) -> Result<(Tensor, Activity, GradStore)> {
+        self.loss_and_grads_a_wr(ids, targets, wt, false, mm)
+    }
+
+    /// v40 (reward learning): as `loss_and_grads_a_w`, but with `raw` the weights are used as given, signed and
+    /// not normalised: loss = sum(w·loss), row gradient scale = w. A negative weight pushes the target's
+    /// probability down (REINFORCE with the outcome as the weight); the caller divides by its own count.
+    pub fn loss_and_grads_a_wr(&self, ids: &Tensor, targets: &Tensor, wt: Option<&Tensor>, raw: bool, mm: &Mm) -> Result<(Tensor, Activity, GradStore)> {
         use crate::fused::{
             attn_bwd_s, attn_fwd_s, hebb_bwd_raw, hebb_fwd_raw, kwta_relu_b, kwta_relu_raw, lif_bwd_b, lif_fwd_b, relu_mask_bwd_b, relu_mask_bwd_raw,
             rms_bwd_raw, ATTN_HS,
@@ -1283,6 +1484,17 @@ impl Model {
             // o: attention output f32, ob: the same as an operand
             Attn { h: Tensor, qkv: Tensor, o: Tensor, ob: Tensor, lse: Tensor, wqkv: Tensor, wo: Tensor },
         }
+        // v40: the engram read (attention over every token so far) after the middle part, before the MLP
+        struct Eng {
+            x_pre: Tensor,
+            h: Tensor,
+            qkv: Tensor,
+            o: Tensor,
+            ob: Tensor,
+            lse: Tensor,
+            wqkv: Tensor,
+            wo: Tensor,
+        }
         struct Saved {
             x_in: Tensor,
             h1: Tensor,
@@ -1291,6 +1503,8 @@ impl Model {
             s: Tensor,
             x_m1: Tensor,
             mid: Mid,
+            eng: Option<Eng>,
+            /// the MLP's input (after the engram read when there is one)
             x_m2: Tensor,
             h2: Tensor,
             a_m: Tensor,
@@ -1298,6 +1512,21 @@ impl Model {
         }
         let mut saved: Vec<Saved> = Vec::with_capacity(self.blocks.len());
         let mut x = tok.embedding(&idf)?; // [N, d]
+        let (place_off, mag_off, eng_off) = self.lesion.get();
+        // v39 glance: x0 = tok[ids] + place_table[place(ids)]
+        let pid = if self.place.is_some() && !place_off { Some(crate::fused::place_ids(ids)?) } else { None };
+        if let (Some(place), Some(pid)) = (&self.place, &pid) {
+            x = x.add(&Self::place_table(&place.detach())?.embedding(pid)?)?;
+        }
+        // v40: x0 += mag_feats(ids) · mag_w (f32; [N, 14] · [14, d])
+        let mfeat = match (&self.mag_w, mag_off) {
+            (Some(mw), false) => {
+                let f = crate::fused::mag_feats(ids)?;
+                x = x.add(&f.matmul(&mw.detach())?)?;
+                Some(f)
+            }
+            _ => None,
+        };
         for blk in &self.blocks {
             let m = blk.mem.as_ref().expect("D/A block has SpikeMem");
             let l = &blk.mlp;
@@ -1319,8 +1548,8 @@ impl Model {
                 let cst = Tensor::cat(&[&g.ba.detach(), &g.bb.detach(), &g.off], 0)?;
                 let h = mm.rms(&x_m1, &hb.norm.detach())?;
                 let p = mm.mm(&h, false, &wcat, false)?; // f32 [N, 4d + 2H]
-                let (o, ck) = hebb_fwd_raw(&p, &cst, b, t, nh, NORM_EPS)?;
-                let o = mm.op(&o)?;
+                // v40: under bf16 the kernel writes O's bf16 operand itself (the same bits as the cast)
+                let (o, ck) = if bf { crate::fused::hebb_fwd_raw_b(&p, &cst, b, t, nh, NORM_EPS)? } else { hebb_fwd_raw(&p, &cst, b, t, nh, NORM_EPS)? };
                 let wo = mm.op(&hb.wo.detach())?;
                 let x_m2 = x_m1.add(&mm.mm(&o, false, &wo, false)?)?;
                 (Mid::Hebb { h, p, cst, ck, o, wcat, wo }, x_m2)
@@ -1342,6 +1571,26 @@ impl Model {
                 let x_m2 = x_m1.add(&mm.mm(&ob, false, &wo, false)?)?;
                 (Mid::Attn { h, qkv, o, ob, lse, wqkv, wo }, x_m2)
             };
+            let (eng, x_m2) = match (&blk.eng, eng_off) {
+                (Some(e), false) => {
+                    let wqkv = mm.op(&Tensor::cat(&[&e.wq.detach(), &e.wk.detach(), &e.wv.detach()], 1)?)?;
+                    let wo = mm.op(&e.wo.detach())?;
+                    let h = mm.rms(&x_m2, &e.norm.detach())?;
+                    let (qkv, o, ob, lse) = if tc {
+                        let qkv = crate::fused::mm_bf16_b(&h, false, &wqkv, false)?;
+                        let (ob, lse) = crate::fused::attn_fwd_tc(&qkv, b, t, scale)?;
+                        (qkv, ob.clone(), ob, lse)
+                    } else {
+                        let qkv = mm.mm(&h, false, &wqkv, false)?;
+                        let (o, ob, lse) = attn_fwd_s(&qkv, b, t, scale)?;
+                        let ob = if bf { ob } else { o.clone() };
+                        (qkv, o, ob, lse)
+                    };
+                    let x_m3 = x_m2.add(&mm.mm(&ob, false, &wo, false)?)?;
+                    (Some(Eng { x_pre: x_m2, h, qkv, o, ob, lse, wqkv, wo }), x_m3)
+                }
+                _ => (None, x_m2),
+            };
             let h2 = mm.rms(&x_m2, &l.norm.detach())?;
             let u = mm.mm(&h2, false, &w[2], false)?;
             let a_m = if bf { kwta_relu_b(&u, k)? } else { kwta_relu_raw(&u, k)? };
@@ -1350,7 +1599,7 @@ impl Model {
             if track {
                 act.kwta_post.push(mean_rows_first(&a_m.gt(0.0)?.to_dtype(DType::F32)?)?);
             }
-            saved.push(Saved { x_in: x, h1, cur, beta, s, x_m1, mid, x_m2, h2, a_m, w });
+            saved.push(Saved { x_in: x, h1, cur, beta, s, x_m1, mid, eng, x_m2, h2, a_m, w });
             x = x_out;
         }
         let gf = self.final_norm.detach();
@@ -1359,6 +1608,10 @@ impl Model {
         let ce = ce_fwd_raw(&logits, &tg)?; // [N, 2] = (loss, lse)
         let (loss, row_scale) = match wt {
             None => (ce.narrow(1, 0, 1)?.mean_all()?, Tensor::full((1.0 / n as f64) as f32, (n, 1), dev)?),
+            Some(w) if raw => {
+                let w = w.reshape((n, 1))?.contiguous()?;
+                (ce.narrow(1, 0, 1)?.mul(&w)?.sum_all()?, w)
+            }
             Some(w) => {
                 let w = w.reshape((n, 1))?;
                 let ws = w.broadcast_div(&w.sum_all()?)?; // [N, 1] = w / sum(w)
@@ -1391,6 +1644,27 @@ impl Model {
             let (dxm, dg2) = rms_bwd_raw(&sv.x_m2, &l.norm.detach(), &dh2, NORM_EPS)?;
             grads.insert(&l.norm, dg2);
             (dx, dx_m) = mm.add(&dx, &dxm)?;
+            // v40: x_m3 = x_m2 + engram(rms(x_m2))
+            if let Some(es) = &sv.eng {
+                let e = blk.eng.as_ref().expect("engram block");
+                grads.insert(&e.wo, mm.mm(&es.ob, true, &dx_m, false)?);
+                let dqkv = if tc {
+                    let dout = crate::fused::mm_bf16_b(&dx_m, false, &es.wo, true)?;
+                    crate::fused::attn_bwd_tc(&es.qkv, &es.ob, &es.lse, &dout, b, t, scale)?
+                } else {
+                    let dout = mm.mm(&dx_m, false, &es.wo, true)?;
+                    let dqkv = attn_bwd_s(&es.qkv, &es.o, &es.lse, &dout, b, t, scale)?;
+                    if bf { dqkv } else { dqkv.to_dtype(DType::F32)? }
+                };
+                let dw = mm.mm(&es.h, true, &dqkv, false)?;
+                grads.insert(&e.wq, dw.narrow(1, 0, d)?.contiguous()?);
+                grads.insert(&e.wk, dw.narrow(1, d, d)?.contiguous()?);
+                grads.insert(&e.wv, dw.narrow(1, 2 * d, d)?.contiguous()?);
+                let dh = mm.mm(&dqkv, false, &es.wqkv, true)?;
+                let (dxi, dgn) = rms_bwd_raw(&es.x_pre, &e.norm.detach(), &dh, NORM_EPS)?;
+                grads.insert(&e.norm, dgn);
+                (dx, dx_m) = mm.add(&dx, &dxi)?;
+            }
             // x_m2 = x_m1 + (fast weights or attention)(rms(x_m1))
             match &sv.mid {
                 Mid::Hebb { h, p, cst, ck, o, wcat, wo } => {
@@ -1399,9 +1673,16 @@ impl Model {
                     let wg = hb.wg.as_ref().expect("D has an output gate");
                     grads.insert(&hb.wo, mm.mm(o, true, &dx_m, false)?);
                     let d_o = mm.mm(&dx_m, false, wo, true)?; // f32 [N, d]
-                    let dp = hebb_bwd_raw(p, cst, ck, &d_o, b, t, nh, NORM_EPS)?; // f32 [N, 4d + 2H]
+                    // v40: under bf16 the kernels write dP's bf16 operand itself (the same bits as the cast) and its za,
+                    // zb columns in f32 apart (dz [N, 2H]): the bias gradients read dz at column z0
+                    let (dp_b, dz, z0) = if bf {
+                        let (dp_b, dz) = crate::fused::hebb_bwd_raw_b(p, cst, ck, &d_o, b, t, nh, NORM_EPS)?;
+                        (dp_b, dz, 0)
+                    } else {
+                        let dp = hebb_bwd_raw(p, cst, ck, &d_o, b, t, nh, NORM_EPS)?; // f32 [N, 4d + 2H]
+                        (dp.clone(), dp, 4 * d)
+                    };
                     drop(d_o);
-                    let dp_b = mm.op(&dp)?;
                     let dw = mm.mm(h, true, &dp_b, false)?; // [d, 4d + 2H]
                     grads.insert(&hb.wq, dw.narrow(1, 0, d)?.contiguous()?);
                     grads.insert(&hb.wk, dw.narrow(1, d, d)?.contiguous()?);
@@ -1409,8 +1690,8 @@ impl Model {
                     grads.insert(wg, dw.narrow(1, 3 * d, d)?.contiguous()?);
                     grads.insert(&g.wa, dw.narrow(1, 4 * d, nh)?.contiguous()?);
                     grads.insert(&g.wb, dw.narrow(1, 4 * d + nh, nh)?.contiguous()?);
-                    grads.insert(&g.ba, dp.narrow(1, 4 * d, nh)?.sum(0)?);
-                    grads.insert(&g.bb, dp.narrow(1, 4 * d + nh, nh)?.sum(0)?);
+                    grads.insert(&g.ba, dz.narrow(1, z0, nh)?.sum(0)?);
+                    grads.insert(&g.bb, dz.narrow(1, z0 + nh, nh)?.sum(0)?);
                     let dh = mm.mm(&dp_b, false, wcat, true)?;
                     let (dxi, dgn) = rms_bwd_raw(&sv.x_m1, &hb.norm.detach(), &dh, NORM_EPS)?;
                     grads.insert(&hb.norm, dgn);
@@ -1450,6 +1731,14 @@ impl Model {
             let (dxi, dg1) = rms_bwd_raw(&sv.x_in, &m.norm.detach(), &dh1, NORM_EPS)?;
             grads.insert(&m.norm, dg1);
             (dx, dx_m) = mm.add(&dx, &dxi)?;
+        }
+        // v39 glance: dplace[place] += dx, the "none" row dropped
+        if let (Some(place), Some(pid)) = (&self.place, &pid) {
+            grads.insert(place, crate::fused::place_bwd(pid, &dx, PLACES)?);
+        }
+        // v40: dmag_w = feats^T · dx
+        if let (Some(mw), Some(f)) = (&self.mag_w, &mfeat) {
+            grads.insert(mw, f.t()?.contiguous()?.matmul(&dx)?);
         }
         // embedding: x0 = tok[ids], so dtok[ids] += dx
         grads.insert(&self.tok, crate::fused::embed_bwd_add(&dtok_out, &idf, &dx)?);

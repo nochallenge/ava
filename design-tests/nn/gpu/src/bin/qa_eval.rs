@@ -18,10 +18,9 @@
 
 use ava_data::bpe::{Bpe, EOS, PAD};
 use ava_data::rng::SplitMix64;
-use ava_gpu::model::{Config, Kind, Model, VOCAB};
+use ava_gpu::model::{Kind, Model};
 use ava_gpu::qa::{eval_set, prompt_text, Mc};
-use candle_core::{DType, Device, Tensor, D};
-use candle_nn::{VarBuilder, VarMap};
+use candle_core::{Device, Tensor, D};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -170,9 +169,7 @@ fn report(name: &str, g: &[Graded], tau: Option<f64>) -> f64 {
 }
 
 fn load(path: &PathBuf, kind: Kind, d: usize, layers: usize, dev: &Device) -> Result<Model, String> {
-    let mut varmap = VarMap::new();
-    let model = Model::new(Config::with_kind(kind, VOCAB, d, layers, 256), VarBuilder::from_varmap(&varmap, DType::F32, dev)).map_err(|e| format!("model: {e}"))?;
-    varmap.load(path).map_err(|e| format!("load {}: {e}", path.display()))?;
+    let (_, _varmap, model) = ava_gpu::ckpt::load_expect(path, kind, 256, d, layers, false, dev)?;
     model.set_track_activity(false);
     // the fused inference forward (AVA_FAST_INFER=0: the autograd forward, for checking)
     model.set_inference(std::env::var("AVA_FAST_INFER").map_or(true, |v| v != "0"));
