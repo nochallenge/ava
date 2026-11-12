@@ -1,5 +1,15 @@
 # Ava
 
+Ava is an AI built at home and modelled after the human brain. She has real spiking neurons, a memory
+that changes and adapts while she reads, and a cerebellum that keeps learning while you talk to her.
+She has dopamine, mood, a thalamus, brain rhythms and more. She is written completely in Rust, with
+no Python anywhere, and she was trained on one GPU, an RTX 4070.
+
+She is very small, and she is not smart yet. What she shows is a different way to build a language
+model, working end to end and built so that every part can scale. She needs far more GPUs than one
+home PC has to grow further (see the note below).
+
+**In more detail.**
 Ava is a brain-like language model written in pure Rust by one person on one home PC. Each of her
 blocks has three parts:
 
@@ -36,7 +46,7 @@ happy to continue her development. Open an issue on this repository to get in to
 
 **What is in this release (v0.4)**
 
-- **Ava 0.4** (the v52 brain, answer round 3), the first Ava you can talk to
+- **Ava 0.4**, the first Ava you can talk to
   ([model card](release/ava-0.4/MODEL_CARD.md); weights and the app on the
   [v0.4.0 release page](https://github.com/nochallenge/ava/releases/tag/v0.4.0)). Each test was
   written down before it ran, and each was run once:
@@ -49,6 +59,9 @@ happy to continue her development. Open an issue on this repository to get in to
   with 8-bit weights (int8): no graphics card and no internet connection are needed, and she uses
   about 380 MB of memory. She talks at about 425 tokens per second. Before she answers she
   looks things up in her library, and the app shows the passages she used.
+- **Ten parts modelled on the brain**: a cerebellum, a thalamus, dopamine, mood, neuromodulators,
+  rhythms, dendrites, short-term plasticity, letters and a homeostasis rule. Each was tested alone
+  and all tied her score, so they are kept as brain models, not as gains (see Results).
 - **She learns while you talk.** Her cerebellum's online table (CB2, 12,288 granule units) learns
   from every word she reads and says in a chat. The changes fade back toward her saved brain, with a
   half-life of 256 tokens. Each chat keeps its own changes on your computer, and deleting the chat
@@ -56,63 +69,6 @@ happy to continue her development. Open an issue on this repository to get in to
   stays fast.
 - **The older models stay**: Ava 0.3, Ava (v0.2) and Ava-QA in `release/ava-0.3/`, `release/ava/`
   and `release/ava-qa/`.
-
-**What came in v0.3**
-
-- **Ava 0.3**, one model that reads, counts, reads whole books, answers questions and sleeps
-  ([model card](release/ava-0.3/MODEL_CARD.md); weights on the
-  [v0.3.0 release page](https://github.com/nochallenge/ava/releases/tag/v0.3.0)). Each test was
-  pre-registered and run once on fresh data:
-  - **numbers: +18 points** over the same recipe without this version's training (60.5% vs 42.4%);
-    comparing numbers of different lengths 90.5% vs 46.5%. She sees how long a number is at a glance
-    before reading its digits, as people do;
-  - **sleep: 96.2% after vs 23.8% before** on questions about 150 new people she read about and then
-    slept on (chance 25%);
-  - **long books: her memory helps across 16,384 tokens** of unseen books (0.033 bits per byte better
-    than a memory cut every 256 tokens);
-  - **questions: 40.7% vs 33.0%** on 1,200 held-out science questions, 4 choices (SciQ 56.5%).
-
-  **Synaptic consolidation** keeps sleep from costing her reading: the weights her reading leans on are
-  held in place, so sleep cost +0.016 bits per byte instead of +0.046. Three tests failed and are
-  reported as such: the new attention read is unused, reward learning added nothing measurable, and
-  her reading (1.511) is slightly below v0.2's Ava (1.487).
-- **The v0.2 models stay**: Ava (the reading model, 1.487 bits per byte) and Ava-QA (SciQ 56.4%), in
-  `release/ava/` and `release/ava-qa/`.
-
-**What came in v0.2**
-
-- **Ava**, the v0.2 release model (trained as run Ava-B): d = 384, 8 layers, 19,354,176 weights
-  (17,781,312 outside the embedding). She read 387M tokens (20 per weight) on one RTX 4070 in
-  44 minutes, and scores **1.487 bits per byte** on held-out text. The two v0.1 models scored 1.872 and
-  1.888. Her [model card](release/ava/MODEL_CARD.md), tokenizer and settings are in `release/ava/`;
-  the weights are a download on the [v0.2.0 release page](https://github.com/nochallenge/ava/releases/tag/v0.2.0).
-- **Ava-QA**, Ava taught to answer questions in 95 seconds. While she was taught she also re-read her
-  ordinary text, as the brain replays old memories while it learns something new. On SciQ science
-  questions (4 choices) she went from 41.1% to **56.4%** right, and to 66.2% with the passage shown.
-  She may say "I don't know", and then 64% of the answers she gives are right. Replay cut her
-  forgetting of plain reading by about three quarters (1.487 to 1.550 BPB, against 1.748 without
-  it). [Model card](release/ava-qa/MODEL_CARD.md) in `release/ava-qa/`.
-- **Three pre-registered tests** of her design against a transformer, all at equal tokens per weight:
-  - the fair scaling test of the plain spiking design (v34);
-  - the fast-weight memories (v35);
-  - memory against memory-plus-attention (v36).
-- **A much faster GPU trainer** (`design-tests/nn/gpu`). Plain spiking Ava at Ava-M's shape now trains
-  at 268,000 tokens per second with the card to itself; v0.1's Ava-M run logged 18,946 (that run's load
-  on the card was not recorded). The trainer now has:
-  - a hand-written training step for each model, with no autograd in the hot path;
-  - fused CUDA kernels for the spiking neurons, the fast-weight memory, kWTA, RMSNorm, cross-entropy
-    and AdamW;
-  - bf16 matrix multiplies;
-  - a loop that never waits for the GPU;
-  - a chunk form of her memory for long texts: 16 tokens at a time with small matrix products, 1.8×
-    faster training at context 4,096.
-
-  Every speed-up was checked to give the same numbers before it was used.
-- Everything from v0.1: Ava-S and Ava-M (`release/ava-s`, `release/ava-m`), the dependency-free CPU
-  crates under `design-tests/nn/`, and her first life (a spiking network with no gradient descent that
-  learned word forms and arithmetic habits, solved ARC puzzles, and knew when to say "I don't know").
-- [ARCHITECTURE.md](ARCHITECTURE.md), the technical deep-dive of the CPU engine, and
-  [SCALING.md](SCALING.md), the plan for taking her further.
 
 ## A different way for a language model to think
 
@@ -143,8 +99,10 @@ What Ava adds is:
 
 - **the combination**: spiking membranes, error-correcting fast synapses at many time scales and sparse
   kWTA codes, in one block, with no softmax attention anywhere;
-- **the evidence**: each part was kept only after it beat a transformer of equal size, trained on equal
-  tokens, in a pre-registered test.
+- **the evidence**: her core design was chosen in pre-registered tests against a transformer of equal
+  size, trained on equal tokens (v34 to v36). Later parts were tested against her own earlier block.
+  The ten brain parts added in Ava 0.4 tied it: they were kept because they model the brain without
+  making her worse or much slower, not because they raised her scores (see Results).
 
 ## How she thinks
 
@@ -229,8 +187,10 @@ step, and the backward pass pretends the step was a smooth curve. Her stand-in i
 derivative `f'(x) = 1 / (1 + 4|x|)²` with `x = v − θ`. It is largest when the membrane is close to the
 threshold and fades away from it. In Ava 0.4 a spike can step at `θ` and `2θ`, up or down, and the
 surrogate has one such bump at each step. The gradient flows back through time inside the LIF op and into the
-leak of every channel. The reset term is treated as a constant in the backward pass (the detached
-reset of Zenke and Vogels 2021), which is the standard choice.
+leak of every channel. Up to Ava 0.3 the reset term was treated as a constant in the backward pass
+(the detached reset of Zenke and Vogels 2021), which is the standard choice. In Ava 0.4 the reset
+passes its gradient back, capped so it never grows past the leak alone: with the reset detached,
+training took uphill steps when many neurons fired at once.
 
 The fast synapses are differentiable, so the gradient also flows back through every write and read of
 `F`. The slow weights learn how to use a memory that rewrites itself at every token.
@@ -365,6 +325,13 @@ These are analogies, and some are loose. The table says which.
 | The glance: one mark for a number's length before its digits, and a learned code for each digit's place (v0.3) | Seeing a number's length and shape before reading it; a place-value sense | Loose. It is an input code; what each place means is learned |
 | Engram memory and sleep replay (first life) | Hippocampal episodes and consolidation during sleep | Fair in function, not in mechanism |
 | Abstaining under right-minus-wrong scoring (first life) | Metacognition, the feeling of knowing | Fair in function |
+| The cerebellum (Ava 0.4): a fixed sparse expansion into 12,288 granule units, the top few kept, and a learned read-out that keeps learning from her own error by the delta rule | The cerebellum's granule cells, Golgi inhibition and Purkinje cells learning from error signals (Marr 1969; Albus 1971) | Fair in form. Hers corrects word guesses, not movements |
+| Short-term plasticity (Ava 0.4): each neuron's output tires and recovers with use | Synaptic depression and facilitation (Tsodyks and Markram 1997) | Fair. The same equations, per neuron instead of per synapse |
+| Dopamine and mood (Ava 0.4): gains set by how surprised she was by the last word, and by slow averages of it | Dopamine neurons signal reward prediction error; slower modulators set a baseline state | Loose. Her surprise is about the next word, not about reward |
+| Neuromodulators (Ava 0.4): a small nucleus broadcasts three gains to the later blocks | Brainstem nuclei that broadcast noradrenaline, acetylcholine and dopamine | Loose. Three learned numbers per token |
+| The thalamus (Ava 0.4): a small relay that gates what each block passes on | Thalamic relay and gating between cortical areas | Loose |
+| Rhythms and dendrites (Ava 0.4): periodic gains on memory writes and reads; a gain on each wide-layer unit from the memory read | Theta and gamma oscillations; context arriving on the top dendrites of cortical neurons | Loose |
+| The homeostasis nudge: thresholds move toward a 10% firing rate | Homeostatic plasticity, which keeps a neuron's firing rate in range | Fair in function |
 | Softmax attention | Brains attend, but do not keep and search a copy of every past input | Tested in v36 (model A) and dropped: it did worse than the memory alone at both sizes tested. v0.3 has one attention read for looking things up; it went unused |
 
 ## Results
@@ -375,7 +342,7 @@ pass rule, run once, and judged by the letter.
 
 ### Ava 0.4: answers, a library and a chat app (v42–v52)
 
-She started from the v42 brain s5-v42, which had read 387 million tokens of the new v42 mix. She then read 108 million more tokens of the v41 mix with v52's changes, with 42,140 question-answer pairs mixed in (13,200 steps, the last quarter with 8,192 tokens of context), and was taught to answer in 3 short rounds; rounds 2 and 3 were made from her own practice answers.
+She started from an earlier Ava 0.4 brain, which had read 387 million tokens of a new reading mix. She then read 108 million more tokens of Ava 0.3's mix with the ten brain parts added, with 42,140 question-answer pairs mixed in (13,200 steps, the last quarter with 8,192 tokens of context), and was taught to answer in 3 short rounds; rounds 2 and 3 were made from her own practice answers.
 
 Every test was written down before it ran, and each was run once. Scores are on dev sets unless
 the row says sealed.
@@ -389,7 +356,48 @@ the row says sealed.
 | Fresh sealed test, run once | – | not run |
 | Talking speed in the app (CPU, int8) | – | 425 tokens/s |
 
-**New in v52.** On top of Ava 0.4's 14 block options, she has the brain parts v52 kept (each tested alone first, and kept by a rule written down before the runs): short-term plasticity: each spiking neuron's output tires and recovers with use (depression and facilitation); neuromodulators: a small nucleus reads the first block and sends three signals to the later blocks, like noradrenaline (input gain), acetylcholine (memory write strength) and dopamine (output scale); dendrites: each unit of the wide layer is scaled by a gain from its block's memory read, like the top dendrites of cortical neurons; letters: every word piece also carries a small vector made from its own letters and their places, so she can see spelling; dopamine: from the second block on, the wide layer's output is scaled by how surprised she was by the last word; mood: four slow units follow how surprised she has been lately and scale the input of every later block's neurons; rhythms: every block's memory writes and reads are scaled, per head, by slow and fast rhythms, like theta and gamma waves; a thalamus: a small relay of 16 units reads every block's output and sets graded gates on what each block passes on; a cerebellum: 12,288 granule units make a sparse code of her state and the current word, and a learned read-out corrects her next-word guess; it is the part that keeps learning in the chat app; the homeostasis nudge: the rule that moves each neuron's threshold toward its target firing rate stays on while she grows and is taught. Her training also changed: the spike reset now passes its gradient back (`--lif-reset-grad`), the fix for the training spikes found in v52.
+**Ten brain parts (v52).** On top of Ava 0.4's 14 block options, she has ten parts modelled on the
+brain. Each was tested alone first and kept by a rule written down before the runs:
+
+- **a cerebellum**: 12,288 granule units make a sparse code of her state and the current word, and a
+  learned read-out corrects her next-word guess. It is the part that keeps learning in the chat app;
+- **a thalamus**: a small relay of 16 units reads every block's output and sets graded gates on what
+  each block passes on;
+- **dopamine**: from the second block on, the wide layer's output is scaled by how surprised she was
+  by the last word;
+- **mood**: four slow units follow how surprised she has been lately and scale the input of every
+  later block's neurons;
+- **neuromodulators**: a small nucleus reads the first block and sends three signals to the later
+  blocks, like noradrenaline (input gain), acetylcholine (memory write strength) and dopamine
+  (output scale);
+- **rhythms**: every block's memory writes and reads are scaled, per head, by slow and fast rhythms,
+  like theta and gamma waves;
+- **dendrites**: each unit of the wide layer is scaled by a gain from its block's memory read, like
+  the top dendrites of cortical neurons;
+- **short-term plasticity**: each spiking neuron's output tires and recovers with use (depression
+  and facilitation);
+- **letters**: every word piece also carries a small vector made from its own letters and their
+  places, so she can see spelling;
+- **the homeostasis nudge**: the rule that moves each neuron's threshold toward its target firing
+  rate stays on while she grows and is taught.
+
+Her training also changed: the spike reset now passes its gradient back (`--lif-reset-grad`), the fix
+for the training spikes found in v52.
+
+**What it means.**
+
+- **The brain parts did not make her smarter.** Alone and together they tied the block without them
+  (within 0.005 bits per byte over 4,000 steps). They stay because they model the brain and cost
+  little, in case they pay off at a larger size. The full brain trains slower: about half the speed at
+  short context, and 10% longer for her whole training run (5,925 s against 5,376 s).
+- **She replaced the brain before her (Ava 0.4b) by a narrow margin.** She passed all seven checks
+  written down beforehand: slightly better reading, grammar and numbers before teaching, and faster
+  talking. Her simple answers are weaker: 54 right and 15 wrong, against 58 and 10.
+- **One release rule fails.** On science multiple-choice questions she is 5 points behind Ava 0.3.
+  Because of that the fresh sealed test was not opened, and releasing her was the author's decision,
+  not the rule's.
+- **In conversation she is limited.** She answers short factual questions from her library, greets
+  you, and says "I don't know". She cannot hold a real conversation.
 
 **The chat app.** The app is `ava_live` from the GPU crate, built for the CPU. With no arguments it
 loads the files next to it, uses int8 weights, learns with CB2, saves chats beside it and opens the
@@ -590,6 +598,65 @@ as spent.
 She may answer "I don't know". She is judged by right minus wrong, and by the share right among the
 answers she gives. A confident wrong answer counts against her.
 
+## Release history
+
+**What came in v0.3**
+
+- **Ava 0.3**, one model that reads, counts, reads whole books, answers questions and sleeps
+  ([model card](release/ava-0.3/MODEL_CARD.md); weights on the
+  [v0.3.0 release page](https://github.com/nochallenge/ava/releases/tag/v0.3.0)). Each test was
+  pre-registered and run once on fresh data:
+  - **numbers: +18 points** over the same recipe without this version's training (60.5% vs 42.4%);
+    comparing numbers of different lengths 90.5% vs 46.5%. She sees how long a number is at a glance
+    before reading its digits, as people do;
+  - **sleep: 96.2% after vs 23.8% before** on questions about 150 new people she read about and then
+    slept on (chance 25%);
+  - **long books: her memory helps across 16,384 tokens** of unseen books (0.033 bits per byte better
+    than a memory cut every 256 tokens);
+  - **questions: 40.7% vs 33.0%** on 1,200 held-out science questions, 4 choices (SciQ 56.5%).
+
+  **Synaptic consolidation** keeps sleep from costing her reading: the weights her reading leans on are
+  held in place, so sleep cost +0.016 bits per byte instead of +0.046. Three tests failed and are
+  reported as such: the new attention read is unused, reward learning added nothing measurable, and
+  her reading (1.511) is slightly below v0.2's Ava (1.487).
+- **The v0.2 models stay**: Ava (the reading model, 1.487 bits per byte) and Ava-QA (SciQ 56.4%), in
+  `release/ava/` and `release/ava-qa/`.
+
+**What came in v0.2**
+
+- **Ava**, the v0.2 release model (trained as run Ava-B): d = 384, 8 layers, 19,354,176 weights
+  (17,781,312 outside the embedding). She read 387M tokens (20 per weight) on one RTX 4070 in
+  44 minutes, and scores **1.487 bits per byte** on held-out text. The two v0.1 models scored 1.872 and
+  1.888. Her [model card](release/ava/MODEL_CARD.md), tokenizer and settings are in `release/ava/`;
+  the weights are a download on the [v0.2.0 release page](https://github.com/nochallenge/ava/releases/tag/v0.2.0).
+- **Ava-QA**, Ava taught to answer questions in 95 seconds. While she was taught she also re-read her
+  ordinary text, as the brain replays old memories while it learns something new. On SciQ science
+  questions (4 choices) she went from 41.1% to **56.4%** right, and to 66.2% with the passage shown.
+  She may say "I don't know", and then 64% of the answers she gives are right. Replay cut her
+  forgetting of plain reading by about three quarters (1.487 to 1.550 BPB, against 1.748 without
+  it). [Model card](release/ava-qa/MODEL_CARD.md) in `release/ava-qa/`.
+- **Three pre-registered tests** of her design against a transformer, all at equal tokens per weight:
+  - the fair scaling test of the plain spiking design (v34);
+  - the fast-weight memories (v35);
+  - memory against memory-plus-attention (v36).
+- **A much faster GPU trainer** (`design-tests/nn/gpu`). Plain spiking Ava at Ava-M's shape now trains
+  at 268,000 tokens per second with the card to itself; v0.1's Ava-M run logged 18,946 (that run's load
+  on the card was not recorded). The trainer now has:
+  - a hand-written training step for each model, with no autograd in the hot path;
+  - fused CUDA kernels for the spiking neurons, the fast-weight memory, kWTA, RMSNorm, cross-entropy
+    and AdamW;
+  - bf16 matrix multiplies;
+  - a loop that never waits for the GPU;
+  - a chunk form of her memory for long texts: 16 tokens at a time with small matrix products, 1.8×
+    faster training at context 4,096.
+
+  Every speed-up was checked to give the same numbers before it was used.
+- Everything from v0.1: Ava-S and Ava-M (`release/ava-s`, `release/ava-m`), the dependency-free CPU
+  crates under `design-tests/nn/`, and her first life (a spiking network with no gradient descent that
+  learned word forms and arithmetic habits, solved ARC puzzles, and knew when to say "I don't know").
+- [ARCHITECTURE.md](ARCHITECTURE.md), the technical deep-dive of the CPU engine, and
+  [SCALING.md](SCALING.md), the plan for taking her further.
+
 ## Quick start
 
 You need a recent stable Rust toolchain. For the GPU crate you also need the CUDA toolkit, a C++
@@ -776,6 +843,8 @@ design-tests/nn/brain/    ava_brain  the CPU models (T / S / H), trainer, bits p
                                      train, generate, talk, score, profile
 design-tests/nn/parts/    ava_parts  brain parts built and tested on the CPU before they are switched
                                      on in the GPU model by a flag
+design-tests/nn/online/              the always-online design: hot-swapped weights, episodes, logs
+design-tests/nn/pq/                  a small Parquet reader for the data preparation
 design-tests/nn/viz/                 the chat page (ava_chat.html), the hologram brain
                                      (brain/brain_mesh.js, from BodyParts3D) and brainmesh, the tool
                                      that makes it
@@ -819,11 +888,14 @@ The top-level `src/` is a hello-world placeholder from the project's first day.
 
 ## Limits
 
-- She is tiny: about 20 million weights. Modern language models have thousands of times more.
-- She has read little: about 495M tokens (Ava 0.3) of a small, dialogue-heavy English corpus and 337
-  old books. She knows no other language and very little of the world.
-- Her curve is flatter than a transformer's. At her size, the transformer's fitted line is 0.038
-  BPB ahead of her; the line crosses hers at about 5M weights. Steepening the curve is the main open
+- She is tiny: about 27 million weights in Ava 0.4 (about 20 million before). Modern language models
+  have thousands of times more.
+- She has read little: about 495M tokens of English (educational web pages, the Simple English
+  Wikipedia, dialogue, science sentences and 337 old books). She knows no other language and very
+  little of the world.
+- Her curve is flatter than a transformer's. At v0.2's size, the transformer's fitted line is 0.038
+  BPB ahead of her; the line crosses hers at about 5M weights. Ava 0.4 was not tested against a
+  transformer. Steepening the curve is the main open
   problem (see the roadmap).
 - Ava completes text. Ava-QA answers single questions, but her answers are short and often wrong, and
   ARC Challenge questions are still beyond her. The chat app (v0.4) lets you talk with her, but her
@@ -853,6 +925,8 @@ The top-level `src/` is a hello-world placeholder from the project's first day.
   arithmetic habits) are not yet connected to it; abstention is, through Ava-QA's "I don't know".
 
 ## Roadmap
+
+Development is paused (see the note at the top). This is what would come next with more GPUs.
 
 1. **A steeper curve.** Find the part that makes her gain faster with size than a transformer, and
    prove it at three or more sizes. Candidates:
