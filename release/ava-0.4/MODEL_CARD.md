@@ -7,11 +7,11 @@ comes with a chat app for Windows. Behind the chat, a 3D brain lights up from he
 She keeps learning while you talk. A small part that works like the cerebellum (CB2) adjusts her next-word guesses
 from what she reads and says. Each chat keeps its own changes, and they slowly fade. Her saved weights never change.
 
-The brain in this release is **the v52 brain, answer round 3**.
+The brain in this release is **Ava 0.4**.
 
 | | |
 |---|---|
-| Model | the v52 brain, answer round 3 (model D; block options in `arch.txt`) |
+| Model | Ava 0.4 (model D; block options in `arch.txt`) |
 | Release date | 2026-11-11 |
 | Author | nochallenge |
 | Licence | PolyForm Noncommercial 1.0.0 (source-available) |
@@ -44,7 +44,7 @@ Each of her 8 blocks has spiking neurons whose membranes carry the past, a fast-
 
 ## How she was made
 
-She started from the v42 brain s5-v42, which had read 387 million tokens of the new v42 mix. She then read 108 million more tokens of the v41 mix with v52's changes, with 42,140 question-answer pairs mixed in (13,200 steps, the last quarter with 8,192 tokens of context), and was taught to answer in 3 short rounds; rounds 2 and 3 were made from her own practice answers.
+She started from an earlier Ava 0.4 brain, which had read 387 million tokens of a new reading mix. She then read 108 million more tokens of Ava 0.3's mix with the ten brain parts added, with 42,140 question-answer pairs mixed in (13,200 steps, the last quarter with 8,192 tokens of context), and was taught to answer in 3 short rounds; rounds 2 and 3 were made from her own practice answers.
 
 The full settings are in `config.txt`, and each training phase's result is in `result.tsv`.
 
