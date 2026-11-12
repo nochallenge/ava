@@ -177,6 +177,10 @@ fn run() -> Result<(), String> {
     let steps = epochs * batches.len();
     let steps_run = max_steps.map_or(steps, |m| m.min(steps));
 
+    // v42: a model with block options (its arch.txt) would load here without its parts; refuse it plainly
+    if let Some((ar, p)) = ava_gpu::ckpt::arch_beside(&init)? {
+        return Err(format!("{}: block options{} (from {}); sft_gpu builds today's block only (grow_gpu takes them)", init.display(), ar.signature(), p.display()));
+    }
     let cfg = Config::with_kind(kind, VOCAB, d, layers, eval_ctx);
     let mut varmap = VarMap::new();
     let model = Model::new(cfg, VarBuilder::from_varmap(&varmap, DType::F32, &dev)).map_err(|e| format!("model: {e}"))?;

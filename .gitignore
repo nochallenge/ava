@@ -16,3 +16,22 @@ release/ava-qa/model.safetensors
 **/target-*/
 design-tests/nn/gpu-fast/
 release/ava-0.3/model.safetensors
+# v0.4: working copies of the gpu crate and patch backups are never published
+design-tests/nn/gpu-*/
+*.orig
+*.rej
+# v0.4: build output of every crate (target/, target-*/, target_*/)
+target*/
+# v0.4: run folders and notes stay private
+**/runs/
+notes/
+# v0.4: model weights are release-page downloads (release/ava-m/model.safetensors stays tracked from v0.1)
+*.safetensors
+# v0.4: logs and console captures
+*.log
+*.out
+# v0.4: the chat app's saved chats (next to Ava.exe) and app builds
+chats/
+*.exe
+*.pdb
+design-tests/nn/viz/chat_mock/

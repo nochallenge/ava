@@ -52,7 +52,7 @@ pub fn seq_nll(model: &Model, dev: &Device, seqs: &[Vec<u32>], batch: usize) -> 
                 keep.push(if real { 1f32 } else { 0f32 });
             }
         }
-        let logits = model.forward(&Tensor::from_vec(ids, (b, t), dev)?)?; // [b·t, V]
+        let logits = score_logits(model, &Tensor::from_vec(ids, (b, t), dev)?)?; // [b·t, V] (v52: the switch)
         let lp = candle_nn::ops::log_softmax(&logits, D::Minus1)?;
         let picked = lp.gather(&Tensor::from_vec(tg, (b * t, 1), dev)?, 1)?.squeeze(1)?;
         let nll: Vec<f32> = picked.neg()?.mul(&Tensor::from_vec(keep, b * t, dev)?)?.reshape((b, t))?.sum(1)?.to_vec1()?;
@@ -181,7 +181,7 @@ pub fn train_io(windows: &[Vec<u32>]) -> (Vec<u32>, Vec<u32>) {
 /// Score one batch: per-row -log softmax(logits)[target] in f64 for rows whose target is not IGNORE.
 fn score_batch(model: &Model, ids: &[u32], tg: &[u32], b: usize, t: usize, byte_len: &[u32], dev: &Device, acc: &mut BpbAcc) -> Result<()> {
     let ids_t = Tensor::from_slice(ids, (b, t), dev)?;
-    let logits = model.forward(&ids_t)?; // [b·t, V] f32
+    let logits = score_logits(model, &ids_t)?; // [b·t, V] f32 (v52: the switch)
     let safe: Vec<u32> = tg.iter().map(|&x| if x == IGNORE { 0 } else { x }).collect();
     let tg_t = Tensor::from_slice(&safe, (b * t, 1), dev)?;
     let lsm = candle_nn::ops::log_softmax(&logits.to_dtype(DType::F64)?, D::Minus1)?;
@@ -229,4 +229,50 @@ where
         score_batch(model, &ids, &tg, b, t, byte_len, dev, &mut acc)?;
     }
     Ok((acc, n_windows))
+}
+
+// ---------------------------------------------------------------- v52 fasteval: the scoring forward's switch
+
+static FUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// v52 fasteval (runs/v52/fasteval.md): score on the fused forward (`--fused` on the scoring tools, `--fused-eval` on
+/// grow_gpu's end-of-run eval) or on the reference forward, Model::forward (off, the default). Every scoring function
+/// here (evaluate, seq_nll, mc::scored_nll, long_eval) gets its logits from `score_logits`.
+pub fn set_fused(on: bool) {
+    FUSED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn fused() -> bool {
+    FUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// What the scoring tools print under --fused for `model` on `dev` (as `would_take`'s line for the training step):
+/// the fused forward it takes, or the reference forward and why.
+pub fn fused_line(model: &Model, dev: &Device) -> String {
+    match model.fused_eval_why(dev) {
+        None => format!("scoring forward: {}", model.fused_eval_name()),
+        Some(why) => format!("scoring forward: the reference forward (fused off: {why})"),
+    }
+}
+
+/// The logits [B·T, V] f32 the scorers read for `ids` [B, T]: with the switch on and nothing against it
+/// (Model::fused_eval_why), the fused forward (Model::logits_fused); otherwise Model::forward, as before. A reason is
+/// printed once per distinct line.
+pub fn score_logits(model: &Model, ids: &Tensor) -> Result<Tensor> {
+    if fused() {
+        match model.fused_eval_why(ids.device()) {
+            None => return model.logits_fused(ids),
+            Some(why) => note_once(format!("--fused: the reference forward here ({why})")),
+        }
+    }
+    model.forward(ids)
+}
+
+fn note_once(line: String) {
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&line) {
+        eprintln!("{line}");
+        seen.push(line);
+    }
 }

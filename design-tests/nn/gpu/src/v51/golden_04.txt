@@ -1,0 +1,26 @@
+ava04.forward	f015f825283a264a
+ava04.fused_blocker	None
+ava04.grads	bce78f3b97dd0215
+ava04.homeo	6705116a4fbf4585
+ava04.int8_stream	9d1cc88bd43df6dd
+ava04.pieces	f7631b88e8a9b255
+ava04.signature	 head_size=64 timescales=fixed gates=channel value_residual=1 kwta=1/4 mlp_act=relu2 mem_momentum=0.5 resid_fix=1 residual=dense lif_init=logspaced lif_scale=1 spikes=int2 alif=1 homeostasis=0.1
+ava04.state	f6d540176a769b25
+ava04.state_names	eng.k,eng.v,eng.valid,lif.0.a,lif.0.s,lif.0.v,lif.1.a,lif.1.s,lif.1.v,lif.2.a,lif.2.s,lif.2.v,mem.0.f,mem.0.s,mem.1.f,mem.1.s,mem.2.f,mem.2.s,meta.blocks,meta.cap,meta.hist,meta.hist_len,meta.model,meta.seen
+ava04.stream	0180ab746c2cc6e0
+ava04.trace	061035662a343e28
+ava04.var_names	b0.dense,b0.hebb.ba,b0.hebb.bb,b0.hebb.norm,b0.hebb.wa,b0.hebb.wa1,b0.hebb.wa2,b0.hebb.wb,b0.hebb.wb1,b0.hebb.wb2,b0.hebb.we,b0.hebb.wg,b0.hebb.wk,b0.hebb.wo,b0.hebb.wq,b0.hebb.wv,b0.mem.again,b0.mem.arho,b0.mem.beta,b0.mem.norm,b0.mem.theta,b0.mem.win,b0.mem.wout,b0.mlp.norm,b0.mlp.w1,b0.mlp.w2,b1.dense,b1.eng.norm,b1.eng.wk,b1.eng.wo,b1.eng.wq,b1.eng.wv,b1.hebb.ba,b1.hebb.bb,b1.hebb.norm,b1.hebb.vres,b1.hebb.wa,b1.hebb.wa1,b1.hebb.wa2,b1.hebb.wb,b1.hebb.wb1,b1.hebb.wb2,b1.hebb.we,b1.hebb.wg,b1.hebb.wk,b1.hebb.wo,b1.hebb.wq,b1.hebb.wv,b1.mem.again,b1.mem.arho,b1.mem.beta,b1.mem.norm,b1.mem.theta,b1.mem.win,b1.mem.wout,b1.mlp.norm,b1.mlp.w1,b1.mlp.w2,b2.dense,b2.hebb.ba,b2.hebb.bb,b2.hebb.norm,b2.hebb.vres,b2.hebb.wa,b2.hebb.wa1,b2.hebb.wa2,b2.hebb.wb,b2.hebb.wb1,b2.hebb.wb2,b2.hebb.we,b2.hebb.wg,b2.hebb.wk,b2.hebb.wo,b2.hebb.wq,b2.hebb.wv,b2.mem.again,b2.mem.arho,b2.mem.beta,b2.mem.norm,b2.mem.theta,b2.mem.win,b2.mem.wout,b2.mlp.norm,b2.mlp.w1,b2.mlp.w2,final.norm,mag_w,place_emb,tok_emb
+ava04.weights	(1435801, 905625)
+plainD.forward	2b0456e059e12336
+plainD.fused_blocker	None
+plainD.grads	3066ec3c3ba0d192
+plainD.homeo	cbf29ce484222325
+plainD.int8_stream	93c37fe0e62e2bec
+plainD.pieces	09456e9f454cea39
+plainD.signature	
+plainD.state	8d54c69ac10e0f5e
+plainD.state_names	lif.0.s,lif.0.v,lif.1.s,lif.1.v,mem.0.f,mem.1.f,meta.blocks,meta.cap,meta.hist,meta.hist_len,meta.model,meta.seen
+plainD.stream	ea1dd3077eef841e
+plainD.trace	46c91104f93fd213
+plainD.var_names	b0.hebb.ba,b0.hebb.bb,b0.hebb.norm,b0.hebb.wa,b0.hebb.wb,b0.hebb.wg,b0.hebb.wk,b0.hebb.wo,b0.hebb.wq,b0.hebb.wv,b0.mem.beta,b0.mem.norm,b0.mem.win,b0.mem.wout,b0.mlp.norm,b0.mlp.w1,b0.mlp.w2,b1.hebb.ba,b1.hebb.bb,b1.hebb.norm,b1.hebb.wa,b1.hebb.wb,b1.hebb.wg,b1.hebb.wk,b1.hebb.wo,b1.hebb.wq,b1.hebb.wv,b1.mem.beta,b1.mem.norm,b1.mem.win,b1.mem.wout,b1.mlp.norm,b1.mlp.w1,b1.mlp.w2,final.norm,tok_emb
+plainD.weights	(140488, 123976)

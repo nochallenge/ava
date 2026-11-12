@@ -1,0 +1,13 @@
+# TESTING / DESIGN ONLY: a small std-only Parquet reader for Ava's downloaded reading (v42, item V1).
+[package]
+name = "ava_pq"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+# Detached from any parent workspace, like the other nn crates.
+[workspace]
+
+[profile.release]
+opt-level = 3

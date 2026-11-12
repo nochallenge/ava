@@ -48,7 +48,7 @@
 //   cargo run --release --example blimp_class -- kinds-dev     plain, open, open + each block that is on (both on: each
 //                                                              alone and both), dev / half A / half B
 //   The probe tools also read open+class, open+endings and open+both when their switches are on.
-// TOOL FIXES (B2, from the lead's ruling on B0/B1; measuring only, no switch): word-matched mirror nets (pairs grouped by
+// TOOL FIXES (B2, from the B0/B1 findings; measuring only, no switch): word-matched mirror nets (pairs grouped by
 // her openers among the swapped words, read from the contrasted word's side), printed after the pooled nets; and probe
 // refuses a per-word path that does not end in .tsv (so "probe plain" cannot write a file named "plain").
 //
@@ -1195,7 +1195,7 @@ fn probe(pairs: &[Pair], uids: &[String], part: &str, base: Reader, new: Reader,
             for l in mirror_part(&MIRRORS, true, uids, &dev, &rb, &rn, q) { say!(out, "{l}"); }
             for l in mirror_part(&MIRROR_WIDE, false, uids, &dev, &rb, &rn, q) { say!(out, "{l}  (apart)"); }
         }
-        // v31 B2 tool fix (the lead's ruling on B0/B1): the word-matched nets, judged from now on
+        // v31 B2 tool fix (from the B0/B1 findings): the word-matched nets, judged from now on
         let labs = opener_labels(&dev, &trig);
         for l in matched_report(&labs, uids, &dev, &rb, &rn, bn, nn) { say!(out, "{l}"); }
     }
@@ -1498,7 +1498,7 @@ fn opener_labels(dev: &[&Pair], trig: &[u64]) -> Vec<(String, String)> {
 /// one cell of a mirror group: a label found on both sides, and its pairs on side 1 and side 2
 struct Cell { label: String, s: [Vec<usize>; 2] }
 
-/// v31 B2 tool fix (the lead's ruling on B0/B1): word-matched mirror nets on one part of dev. Each pair is labelled by
+/// v31 B2 tool fix (from the B0/B1 findings): word-matched mirror nets on one part of dev. Each pair is labelled by
 /// her openers among its swapped words, read from the side of the contrasted word: "openers in the sentence that holds
 /// it / openers in the other sentence" (side 1: good / bad; side 2: bad / good). A cell is one label found on both sides
 /// of a group in this part. In a cell, a1 and a2 are the share right of its side-1 and side-2 pairs (pairs pooled over a

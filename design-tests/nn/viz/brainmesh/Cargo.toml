@@ -1,0 +1,12 @@
+# TESTING / DESIGN ONLY: turns the BodyParts3D brain meshes into one compact file for the chat app's brain.
+[package]
+name = "brainmesh"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[workspace]
+
+[profile.release]
+opt-level = 3

@@ -1,0 +1,588 @@
+<!-- TESTING / DESIGN ONLY — Ava live: her real neurons, streamed from ava_live while she reads and answers. No libraries, no network beyond this machine. -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ava Live Brain</title>
+<style>
+  :root {
+    --bg: #000;
+    --gold: #f0c36a;
+    --gold-hi: #ffe8b5;
+    --amber: #ffae42;
+    --dim: #8a6a35;
+    --faint: rgba(240, 195, 106, 0.16);
+    --ink: #d9c6a0;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, "SF Mono", Menlo, monospace;
+    --sans: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); font-family: var(--sans); overflow: hidden; }
+  #stage { position: fixed; inset: 0; cursor: grab; touch-action: none; }
+  #stage.drag { cursor: grabbing; }
+  #stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  #hud { position: fixed; inset: 0; pointer-events: none; }
+  #hud .panel { position: absolute; pointer-events: auto; }
+  .cap { font: 600 10px var(--sans); letter-spacing: 0.28em; text-transform: uppercase; color: var(--dim); margin: 0 0 7px; }
+  .frame { border: 1px solid rgba(240, 195, 106, 0.16); border-radius: 2px; background: linear-gradient(180deg, rgba(30, 20, 6, 0.42), rgba(0, 0, 0, 0.2)); padding: 10px 12px; position: relative; }
+  .frame::before, .frame::after { content: ""; position: absolute; width: 10px; height: 10px; border-color: var(--gold); border-style: solid; opacity: 0.7; }
+  .frame::before { top: -1px; left: -1px; border-width: 1px 0 0 1px; }
+  .frame::after { bottom: -1px; right: -1px; border-width: 0 1px 1px 0; }
+
+  #title { top: 20px; left: 24px; }
+  #title .brand { font-size: 28px; letter-spacing: 0.6em; font-weight: 300; color: var(--gold-hi); text-shadow: 0 0 18px rgba(255, 190, 90, 0.5); }
+  #title .sub { margin-top: 4px; font-size: 10px; letter-spacing: 0.3em; text-transform: uppercase; color: var(--dim); }
+  #title .meta { margin-top: 8px; font: 10.5px/1.55 var(--mono); color: #9a8057; max-width: 330px; }
+  #status { margin-top: 10px; font: 600 11px var(--sans); letter-spacing: 0.3em; color: var(--gold); display: flex; align-items: center; gap: 8px; }
+  #status i { width: 8px; height: 8px; border-radius: 50%; background: #5a4628; box-shadow: none; }
+  #status.live i { background: var(--amber); box-shadow: 0 0 10px var(--amber); }
+  #status.off { color: #a0573c; }
+
+  #metrics { top: 20px; right: 24px; width: 270px; font: 11px/1.7 var(--mono); }
+  #metrics .row { display: flex; justify-content: space-between; }
+  #metrics .row b { color: var(--gold-hi); font-weight: 400; }
+
+  #cortexPanel { left: 24px; top: 50%; transform: translateY(-46%); width: 236px; font: 10.5px var(--mono); }
+  .lrow { display: grid; grid-template-columns: 22px 1fr 44px; gap: 6px; align-items: center; height: 15px; color: #b09468; }
+  .bar { height: 4px; background: rgba(240, 195, 106, 0.09); position: relative; overflow: hidden; }
+  .bar i { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: linear-gradient(90deg, #a06a24, #ffd27a); }
+  .bar.th i { background: linear-gradient(90deg, #6d5530, #fff0c8); }
+  .bar.mem i { background: linear-gradient(90deg, #5c4a2c, #f6e3b4); }
+  .lrow .n { text-align: right; color: var(--gold); }
+  .sect { margin-top: 10px; }
+
+  #speakPanel { right: 24px; top: 50%; transform: translateY(-46%); width: 270px; }
+  .guess { display: grid; grid-template-columns: 1fr 70px 46px; gap: 8px; align-items: center; font: 12px var(--mono); height: 21px; }
+  .guess .t { color: var(--gold); white-space: pre; overflow: hidden; text-overflow: ellipsis; }
+  .guess .v { text-align: right; color: #9a8057; font-size: 10.5px; }
+  .guess.top .t { color: var(--gold-hi); text-shadow: 0 0 8px rgba(255, 200, 100, 0.7); }
+  #says { margin-top: 12px; min-height: 48px; max-height: 150px; overflow: auto; font: 300 17px/1.4 var(--sans); color: var(--gold-hi); text-shadow: 0 0 12px rgba(255, 190, 90, 0.35); white-space: pre-wrap; }
+  #lookback { margin-top: 10px; font: 10.5px/1.6 var(--mono); color: #9a8057; min-height: 40px; }
+  #lookback b { color: var(--gold); font-weight: 400; white-space: pre; }
+
+  #bottom { left: 50%; transform: translateX(-50%); bottom: 16px; width: min(1000px, calc(100vw - 32px)); display: flex; flex-direction: column; gap: 10px; }
+  #transcript { max-height: 84px; overflow-y: auto; font: 15px/1.6 var(--mono); color: rgba(217, 198, 160, 0.4); white-space: pre-wrap; word-break: break-word; scrollbar-width: thin; scrollbar-color: #4a3a20 transparent; }
+  #transcript span { transition: color 0.25s, text-shadow 0.25s, background 0.25s; border-radius: 2px; }
+  #transcript span.read { color: rgba(217, 198, 160, 0.62); }
+  #transcript span.say { color: var(--gold-hi); }
+  #transcript span.cur { color: #fff6df; text-shadow: 0 0 12px rgba(255, 190, 80, 1), 0 0 2px #ffd27a; }
+  #transcript span.mk { font-size: 10px; vertical-align: super; color: rgba(240, 195, 106, 0.55); }
+  #transcript span.lb { background: rgba(255, 210, 120, var(--w, 0)); }
+  #ask { display: flex; gap: 8px; }
+  #ask input { flex: 1; min-width: 0; height: 36px; background: rgba(12, 9, 4, 0.85); border: 1px solid rgba(240, 195, 106, 0.3); border-radius: 2px; color: var(--gold-hi); padding: 0 12px; font: 14px var(--sans); outline: none; }
+  #ask input:focus { border-color: rgba(240, 195, 106, 0.75); box-shadow: 0 0 12px rgba(240, 195, 106, 0.2); }
+  #ask button { height: 36px; padding: 0 16px; background: rgba(240, 195, 106, 0.08); color: var(--gold); border: 1px solid rgba(240, 195, 106, 0.38); border-radius: 2px; font: 600 11px var(--sans); letter-spacing: 0.2em; text-transform: uppercase; cursor: pointer; }
+  #ask button:hover:not(:disabled) { background: rgba(240, 195, 106, 0.18); color: var(--gold-hi); }
+  #ask button:disabled { opacity: 0.35; cursor: default; }
+  #note { font: 10px var(--sans); color: #6c5734; letter-spacing: 0.06em; text-align: center; }
+  #offline { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; flex-direction: column; gap: 8px; pointer-events: none; color: #b09468; font-size: 14px; }
+  #offline code { font: 12px var(--mono); color: var(--dim); }
+  body.offline #offline { display: flex; }
+  @media (max-width: 1100px) { #title .meta { display: none; } #metrics { width: 215px; font-size: 10px; } }
+  @media (max-width: 900px) { #cortexPanel, #speakPanel { display: none; } #metrics { width: 200px; } }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="gl"></canvas><canvas id="ov"></canvas></div>
+<div id="hud">
+  <div id="title" class="panel">
+    <div class="brand">AVA</div>
+    <div class="sub">live spiking brain · every flash is a real spike</div>
+    <div class="meta" id="meta">connecting…</div>
+    <div id="status"><i></i><span id="statusText">CONNECTING</span></div>
+  </div>
+  <div id="metrics" class="panel frame">
+    <div class="cap">Telemetry</div>
+    <div class="row"><span>live rate</span><b id="mRate">–</b></div>
+    <div class="row"><span>compute</span><b id="mMs">–</b></div>
+    <div class="row"><span>spikes this token</span><b id="mSpikes">–</b></div>
+    <div class="row"><span>MLP units passing</span><b id="mWin">–</b></div>
+    <div class="row"><span>token in turn</span><b id="mPos">–</b></div>
+  </div>
+  <div id="cortexPanel" class="panel frame">
+    <div class="cap">Cortex · spikes per layer</div>
+    <div id="rowsSpk"></div>
+    <div class="sect cap">Thinking · kWTA units passing</div>
+    <div id="rowsWin"></div>
+    <div class="sect cap">Memory · write per layer</div>
+    <div id="rowsMem"></div>
+  </div>
+  <div id="speakPanel" class="panel frame">
+    <div class="cap">Speaking · her next-token guesses</div>
+    <div id="guesses"></div>
+    <div class="sect cap">She says</div>
+    <div id="says"></div>
+    <div class="sect cap">Look-back · engram</div>
+    <div id="lookback">–</div>
+  </div>
+  <div id="bottom" class="panel">
+    <div id="transcript" class="frame"></div>
+    <div id="ask">
+      <input id="text" type="text" maxlength="2000" placeholder="Say something to Ava…" autocomplete="off">
+      <button id="bTalk" title="She reads it as a question and answers (Enter)">Talk</button>
+      <button id="bCont" title="She reads it and continues the text (Shift+Enter)">Continue</button>
+      <button id="bStop" title="Stop after the token being computed" disabled>Stop</button>
+    </div>
+    <div id="note">drag to rotate · wheel to zoom · R resets the view · the glow of a spike fades over ~300 ms</div>
+  </div>
+</div>
+<div id="offline"><div>Not connected to Ava.</div><div>Start her with <code>ava_live</code>, then open <code>http://127.0.0.1:8077/</code></div></div>
+
+<script>
+'use strict';
+// ------------------------------------------------------------------ constants
+const TAU = 0.12;            // glow time constant (s): a flash fades to ~8% in 300 ms
+const MW0 = 4.0, MR0 = 2.0;   // memory write / read scales (|delta F|, |q F|; v41 medians 3.8 and 1.9): glow = 1 - exp(-x / scale)
+const $ = (id) => document.getElementById(id);
+const stage = $('stage'), cgl = $('gl'), cov = $('ov'), ov = cov.getContext('2d');
+
+let M = null;                // model shape from "hello"
+let G = null;                // geometry
+let yaw = -0.55, pitch = 0.28, zoom = 1, autoT = 0, userRot = -1e9;
+let reading = null;          // last token event
+let arcs = [];               // engram reads: {pos, w, born}
+let readPulse = 0, sayPulse = 0;
+let tokTimes = [];
+let busy = false;
+const clock = () => performance.now() / 1000;
+
+function mulberry32(a) { return function () { a |= 0; a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+function shuffle(n, rng) { const p = Array.from({ length: n }, (_, i) => i); for (let i = n - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); [p[i], p[j]] = [p[j], p[i]]; } return p; }
+
+// ------------------------------------------------------------------ geometry: her real parts as regions
+// x runs from READING (back, left) through the cortex layers 1..L to SPEAKING (front, right).
+// Each block is one coronal slice: its 384 LIF neurons on the cortex arch, its 12 memory heads in the centre, its
+// 1,536 kWTA units in the thinking disc below.
+function sliceX(l, L) { return L <= 1 ? 0 : -1.35 + 2.7 * l / (L - 1); }
+function envelope(l, L) { const t = L <= 1 ? 0.5 : l / (L - 1); return 0.74 + 0.26 * Math.sin(Math.PI * (0.12 + 0.76 * t)); }
+function memCenter(l, L) { return [sliceX(l, L), 0.2 + 0.07 * Math.sin(l * 0.9), 0.1 * Math.sin(l * 0.7 + 0.5)]; }
+function buildGeometry(m) {
+  const L = m.layers, d = m.d, H = m.hidden, nh = m.heads;
+  const n = L * (d + H + nh);
+  const pos = new Float32Array(n * 3), info = new Float32Array(n * 2), heat = new Float32Array(n * 2);
+  const rows = Math.max(1, Math.round(Math.sqrt(d / 2.7))), cols = Math.ceil(d / rows);
+  const ga = Math.PI * (3 - Math.sqrt(5));
+  const off = { cortex: [], think: [], mem: [] };
+  let k = 0;
+  const put = (x, y, z, region) => { pos[k * 3] = x; pos[k * 3 + 1] = y; pos[k * 3 + 2] = z; info[k * 2] = region; k++; };
+  for (let l = 0; l < L; l++) {
+    const rng = mulberry32(977 + l * 7919), x0 = sliceX(l, L), env = envelope(l, L);
+    off.cortex.push(k);
+    const pc = shuffle(rows * cols, rng);   // neuron j sits at a fixed random cell: positions carry no meaning
+    for (let j = 0; j < d; j++) {
+      const c = pc[j] % cols, r = Math.floor(pc[j] / cols);
+      const phi = (0.1 + 0.8 * (c + 0.5) / cols) * Math.PI;
+      const rad = env * (0.9 + 0.32 * (r + 0.5) / rows);
+      put(x0 + (rng() - 0.5) * 0.05, -0.22 + rad * Math.sin(phi), rad * Math.cos(phi) * 1.12, 0);
+    }
+    off.think.push(k);
+    const pt = shuffle(H, rng);
+    for (let j = 0; j < H; j++) {
+      const i = pt[j], rr = Math.sqrt((i + 0.5) / H), th = i * ga;
+      put(x0 + (rng() - 0.5) * 0.04, -0.66 + Math.sin(th) * rr * 0.26 * env, Math.cos(th) * rr * 0.78 * env, 1);
+    }
+    off.mem.push(k);
+    const [mx, my, mz] = memCenter(l, L);
+    for (let h = 0; h < nh; h++) { const a = 2 * Math.PI * h / nh; put(mx, my + 0.15 * Math.sin(a), mz + 0.15 * Math.cos(a), 2); }
+  }
+  return { L, d, H, nh, n, pos, info, heat, off };
+}
+
+// ------------------------------------------------------------------ WebGL
+let gl = null, prog, bPos, bInfo, bHeat, U = {}, A = {};
+const VS = `
+precision highp float;
+attribute vec3 aPos; attribute vec2 aInfo; attribute vec2 aHeat;
+uniform mat3 uRot; uniform vec2 uScale; uniform float uOffY, uDist, uPx;
+varying vec3 vCol; varying float vHot;
+void main() {
+  vec3 p = uRot * aPos;
+  float persp = uDist / (uDist - p.z);
+  gl_Position = vec4(p.x * persp * uScale.x, p.y * persp * uScale.y + uOffY, 0.0, 1.0);
+  float near = clamp(0.5 + 0.38 * p.z, 0.0, 1.0);
+  float df = mix(0.3, 1.0, near);
+  int reg = int(aInfo.x + 0.5);
+  float h = aHeat.x, h2 = aHeat.y;
+  vec3 col; float size;
+  if (reg == 0) {          // cortex: LIF neuron, flashes on its spike
+    col = vec3(0.95, 0.6, 0.22) * 0.2 * df + vec3(1.0, 0.62, 0.18) * h * 1.25 * df;
+    size = 2.3 + 15.0 * h;
+  } else if (reg == 1) {   // thinking: kWTA unit, flashes when it wins (by its activity)
+    col = vec3(0.9, 0.62, 0.3) * 0.065 * df + vec3(1.0, 0.88, 0.62) * h * 1.1 * df;
+    size = 1.6 + 6.5 * h;
+  } else {                 // memory head: gold = write, white core = read
+    col = vec3(0.95, 0.65, 0.25) * 0.24 * df + vec3(1.0, 0.7, 0.28) * h * 1.1 * df + vec3(1.0, 0.95, 0.85) * h2 * 0.8 * df;
+    size = 3.0 + 16.0 * max(h, h2 * 0.8);
+  }
+  vCol = col; vHot = h;
+  gl_PointSize = max(1.0, size * uPx * persp);
+}`;
+const FS = `
+precision mediump float;
+varying vec3 vCol; varying float vHot;
+void main() {
+  vec2 d = gl_PointCoord - vec2(0.5);
+  float r2 = dot(d, d) * 4.0;
+  if (r2 > 1.0) discard;
+  float a = exp(-r2 * 13.0) + 0.5 * exp(-r2 * 3.0) * (1.0 - r2);
+  gl_FragColor = vec4(vCol * a, 1.0);
+}`;
+function initGL() {
+  try {
+    gl = cgl.getContext('webgl', { antialias: false, alpha: false, premultipliedAlpha: false });
+    if (!gl) return false;
+    const sh = (src, t) => { const s = gl.createShader(t); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; };
+    prog = gl.createProgram(); gl.attachShader(prog, sh(VS, gl.VERTEX_SHADER)); gl.attachShader(prog, sh(FS, gl.FRAGMENT_SHADER)); gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    for (const k of ['uRot', 'uScale', 'uOffY', 'uDist', 'uPx']) U[k] = gl.getUniformLocation(prog, k);
+    for (const k of ['aPos', 'aInfo', 'aHeat']) A[k] = gl.getAttribLocation(prog, k);
+    bPos = gl.createBuffer(); bInfo = gl.createBuffer(); bHeat = gl.createBuffer();
+    gl.clearColor(0, 0, 0, 1);
+    return true;
+  } catch (e) { console.warn('WebGL unavailable; 2D fallback', e); gl = null; return false; }
+}
+function upload() {
+  if (!gl || !G) return;
+  gl.bindBuffer(gl.ARRAY_BUFFER, bPos); gl.bufferData(gl.ARRAY_BUFFER, G.pos, gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, bInfo); gl.bufferData(gl.ARRAY_BUFFER, G.info, gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, bHeat); gl.bufferData(gl.ARRAY_BUFFER, G.heat, gl.DYNAMIC_DRAW);
+}
+
+// ------------------------------------------------------------------ camera
+let W = 1, H = 1, DPR = 1;
+const DIST = 5.2;
+function rot() {
+  const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+  return [cy, 0, sy, sp * sy, cp, -sp * cy, -cp * sy, sp, cp * cy];
+}
+function view() {
+  const k = Math.min(0.56 * W / (2.75 * H), 0.6) * zoom;
+  return { sx: k * H / W, sy: k, offY: 0.16 };
+}
+function proj(R, v, x, y, z) {
+  const px = R[0] * x + R[1] * y + R[2] * z, py = R[3] * x + R[4] * y + R[5] * z, pz = R[6] * x + R[7] * y + R[8] * z;
+  const s = DIST / (DIST - pz);
+  return [W / 2 + px * s * v.sx * W / 2, H / 2 - (py * s * v.sy + v.offY) * H / 2, pz, s];
+}
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = Math.floor(innerWidth * DPR); H = Math.floor(innerHeight * DPR);
+  cgl.width = cov.width = W; cgl.height = cov.height = H;
+  if (gl) gl.viewport(0, 0, W, H);
+}
+
+// ------------------------------------------------------------------ HUD panels
+function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+function show(t) { return t === '\n' ? '⏎' : JSON.stringify(t); }
+function buildRows() {
+  for (const [id, cls] of [['rowsSpk', ''], ['rowsWin', 'th'], ['rowsMem', 'mem']]) {
+    const box = $(id); box.innerHTML = '';
+    for (let l = 0; l < M.layers; l++) box.insertAdjacentHTML('beforeend', `<div class="lrow"><span>L${l + 1}</span><span class="bar ${cls}"><i id="${id}${l}"></i></span><span class="n" id="${id}n${l}">–</span></div>`);
+  }
+}
+function setRow(id, l, frac, label) { const b = $(id + l); if (b) b.style.width = (100 * Math.max(0, Math.min(1, frac))).toFixed(1) + '%'; const n = $(id + 'n' + l); if (n) n.textContent = label; }
+function setStatus(txt, live) { $('statusText').textContent = txt; $('status').classList.toggle('live', !!live); }
+function setBusy(b) { busy = b; $('bTalk').disabled = b; $('bCont').disabled = b; $('bStop').disabled = !b; }
+
+// ------------------------------------------------------------------ the stream
+function onHello(h) {
+  M = h.model;
+  G = buildGeometry(M); upload(); buildRows();
+  $('meta').innerHTML = `${esc(M.name)} · model ${esc(M.kind)} · ${(M.params / 1e6).toFixed(1)}M weights · ${h.device}, ${h.threads} threads<br>` +
+    `${M.layers} layers × (${M.d} LIF neurons + ${M.heads} memory heads + ${M.hidden} kWTA units, k=${M.k})` +
+    (M.engram != null ? `<br>engram (look-back) in layer ${M.engram + 1}` : '') + (M.glance ? ' · glance on' : '') + ` · pace ${h.pace_ms} ms`;
+  document.body.classList.remove('offline');
+  setBusy(!!h.busy);
+  setStatus(h.busy ? 'BUSY' : 'RESTING', false);
+}
+function onTurn(t) {
+  $('transcript').innerHTML = ''; $('says').textContent = ''; arcs = [];
+  setBusy(true); setStatus('READING', true);
+}
+function onTok(e) {
+  if (!G) return;
+  const now = clock();
+  reading = e;
+  tokTimes.push(now); while (tokTimes.length && now - tokTimes[0] > 2) tokTimes.shift();
+  const h = G.heat;
+  let spikes = 0, passing = 0;
+  for (let l = 0; l < G.L; l++) {
+    const la = e.L[l];
+    const co = G.off.cortex[l];
+    for (const j of la.s) h[(co + j) * 2] = 1;
+    spikes += la.s.length;
+    const to = G.off.think[l];
+    let pass = 0;
+    for (let q = 0; q < la.w.length; q++) {
+      const a = la.a.charCodeAt(q) - 48, i = (to + la.w[q]) * 2;
+      const v = a <= 0 ? 0.08 : 0.32 + 0.68 * a / 9;  // a winner whose ReLU passed nothing stays faint
+      if (h[i] < v) h[i] = v;
+      if (a > 0) pass++;
+    }
+    passing += pass;
+    let wsum = 0;
+    if (la.mw) {
+      const mo = G.off.mem[l];
+      for (let q = 0; q < la.mw.length; q++) {
+        const i = (mo + q) * 2;
+        h[i] = Math.max(h[i], 1 - Math.exp(-la.mw[q] / MW0));
+        h[i + 1] = Math.max(h[i + 1], 1 - Math.exp(-(la.mr ? la.mr[q] : 0) / MR0));
+        wsum += la.mw[q];
+      }
+      wsum /= la.mw.length;
+    }
+    setRow('rowsSpk', l, la.s.length / G.d * 8, `${(100 * la.s.length / G.d).toFixed(1)}%`);
+    setRow('rowsWin', l, pass / M.k, `${pass}/${M.k}`);
+    setRow('rowsMem', l, 1 - Math.exp(-wsum / MW0), wsum.toFixed(2));
+  }
+  $('mSpikes').textContent = `${spikes} of ${G.L * G.d} (${(100 * spikes / (G.L * G.d)).toFixed(1)}%)`;
+  $('mWin').textContent = `${passing} of ${G.L * G.H}`;
+  $('mMs').textContent = `${e.ms.toFixed(1)} ms (${(1000 / Math.max(e.ms, 0.01)).toFixed(0)} tok/s)`;
+  $('mPos').textContent = `${e.i + 1} · ${e.phase === 'read' ? 'reading' : 'saying'}`;
+  // transcript: the token just computed, lit
+  const tr = $('transcript');
+  const prev = tr.querySelector('span.cur'); if (prev) prev.classList.remove('cur');
+  const sp = document.createElement('span');
+  sp.dataset.pos = e.i;
+  sp.className = (e.phase === 'read' ? 'read' : 'say') + (e.kind === 2 ? ' mk' : '') + ' cur';
+  sp.textContent = e.kind === 1 ? '¶ ' : e.text.replace(/\n/g, ' ⏎\n');
+  sp.title = `token ${e.i}: ${JSON.stringify(e.text)} (id ${e.id})` + (e.place != null ? ` · place ${e.place}` : '');
+  tr.appendChild(sp);
+  tr.scrollTop = tr.scrollHeight;
+  // look-back: the engram's strongest reads of earlier tokens
+  for (const s of tr.querySelectorAll('span.lb')) { s.classList.remove('lb'); s.style.removeProperty('--w'); }
+  if (e.e) {
+    arcs = e.e.top.map(([p, w]) => ({ p, w, born: now }));
+    for (const [p, w] of e.e.top) { const s = tr.querySelector(`span[data-pos="${p}"]`); if (s) { s.classList.add('lb'); s.style.setProperty('--w', Math.min(0.5, w).toFixed(3)); } }
+    $('lookback').innerHTML = `layer ${e.e.layer + 1} · read size ${e.e.rms.toFixed(3)} · on itself ${e.e.self.toFixed(2)}<br>` +
+      (e.e.top.length ? e.e.top.map(([p, w]) => { const s = tr.querySelector(`span[data-pos="${p}"]`); return `${w.toFixed(2)} <b>${esc(s ? show(s.textContent.trim() || s.textContent) : '#' + p)}</b>`; }).join(' · ') : 'nothing earlier yet');
+  } else arcs = [];
+  // speaking: her guesses for the next token
+  const max = e.p.length ? e.p[0][1] : 1;
+  $('guesses').innerHTML = e.p.map(([t, p], q) => `<div class="guess${q === 0 ? ' top' : ''}"><span class="t">${esc(show(t))}</span><span class="bar"><i style="width:${(100 * p / max).toFixed(1)}%"></i></span><span class="v">${(100 * p).toFixed(1)}%</span></div>`).join('');
+  if (e.phase === 'say') { $('says').textContent = e.reply || ''; sayPulse = 1; setStatus('SPEAKING', true); } else setStatus('READING', true);
+  readPulse = 1;
+}
+function onDone(d) {
+  setBusy(false); setStatus('RESTING', false);
+  $('note').textContent = `turn ${d.turn}: read ${d.read} tokens, said ${d.said} (${d.reason}) · ${d.ms_per_token.toFixed(1)} ms per token computed · drag to rotate · R resets the view`;
+  const prev = $('transcript').querySelector('span.cur'); if (prev) prev.classList.remove('cur');
+}
+function connect() {
+  if (location.protocol === 'file:') { document.body.classList.add('offline'); setStatus('OFFLINE', false); $('status').classList.add('off'); return; }
+  const es = new EventSource('/events');
+  es.onmessage = (m) => {
+    let e; try { e = JSON.parse(m.data); } catch (_) { return; }
+    if (e.type === 'hello') onHello(e);
+    else if (e.type === 'turn') onTurn(e);
+    else if (e.type === 'tok') onTok(e);
+    else if (e.type === 'done') onDone(e);
+    else if (e.type === 'idle') { setBusy(false); setStatus('RESTING', false); }
+    else if (e.type === 'error') { $('note').textContent = 'error: ' + e.message; }
+  };
+  es.onerror = () => { setStatus('RECONNECTING', false); };
+  es.onopen = () => { $('status').classList.remove('off'); };
+}
+async function say(mode) {
+  const text = $('text').value.trim();
+  if (!text || busy) return;
+  setBusy(true);
+  try {
+    const r = await fetch('/say', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode, text }) });
+    if (!r.ok) { setBusy(r.status === 409); $('note').textContent = r.status === 409 ? 'she is still busy with the last turn' : 'could not send: ' + r.status; }
+  } catch (err) { setBusy(false); $('note').textContent = 'not connected'; }
+}
+$('bTalk').onclick = () => say('talk');
+$('bCont').onclick = () => say('continue');
+$('bStop').onclick = () => fetch('/stop', { method: 'POST' }).catch(() => {});
+$('text').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); say(e.shiftKey ? 'continue' : 'talk'); } });
+
+// ------------------------------------------------------------------ overlay: HUD rings, labels, regions, look-back arcs
+function ring3(R, v, cx, cy, cz, r, plane, n) {
+  const pts = [];
+  for (let q = 0; q <= n; q++) {
+    const a = q / n * Math.PI * 2, c = Math.cos(a) * r, s = Math.sin(a) * r;
+    pts.push(plane === 'yz' ? proj(R, v, cx, cy + s, cz + c) : proj(R, v, cx + c, cy, cz + s));
+  }
+  return pts;
+}
+function strokePts(pts, color, width) { ov.strokeStyle = color; ov.lineWidth = width; ov.beginPath(); pts.forEach((p, q) => q ? ov.lineTo(p[0], p[1]) : ov.moveTo(p[0], p[1])); ov.stroke(); }
+function label(R, v, x, y, z, text, sub, dx, dy) {
+  const [px, py] = proj(R, v, x, y, z);
+  const lx = px + dx * DPR, ly = py + dy * DPR;
+  ov.strokeStyle = 'rgba(240,195,106,0.45)'; ov.lineWidth = DPR;
+  ov.beginPath(); ov.moveTo(px, py); ov.lineTo(lx, ly); ov.lineTo(lx + (dx > 0 ? 1 : -1) * 18 * DPR, ly); ov.stroke();
+  ov.fillStyle = 'rgba(255,214,140,0.95)'; ov.beginPath(); ov.arc(px, py, 2.2 * DPR, 0, Math.PI * 2); ov.fill();
+  ov.textAlign = dx > 0 ? 'left' : 'right';
+  const tx = lx + (dx > 0 ? 24 : -24) * DPR;
+  ov.font = `600 ${Math.round(11 * DPR)}px Segoe UI, system-ui, sans-serif`; ov.fillStyle = 'rgba(255,226,170,0.92)';
+  ov.fillText(text.split('').join(' '), tx, ly + 4 * DPR);
+  if (sub) { ov.font = `${Math.round(9.5 * DPR)}px ui-monospace, Consolas, monospace`; ov.fillStyle = 'rgba(176,148,104,0.85)'; ov.fillText(sub, tx, ly + 17 * DPR); }
+}
+function drawOverlay(R, v, t) {
+  ov.clearRect(0, 0, W, H);
+  if (!G) return;
+  const L = G.L;
+  ov.save(); ov.globalCompositeOperation = 'lighter';
+  // base platform: two thin rings with ticks (HUD frame only, never activity)
+  const base = -1.38;
+  strokePts(ring3(R, v, 0, base, 0, 2.55, 'xz', 120), 'rgba(240,195,106,0.16)', DPR);
+  strokePts(ring3(R, v, 0, base, 0, 2.3, 'xz', 120), 'rgba(240,195,106,0.08)', DPR);
+  ov.strokeStyle = 'rgba(240,195,106,0.22)'; ov.lineWidth = DPR; ov.beginPath();
+  for (let q = 0; q < 96; q++) {
+    const a = q / 96 * Math.PI * 2 + t * 0.03, r1 = 2.55, r2 = q % 8 === 0 ? 2.68 : 2.61;
+    const p1 = proj(R, v, Math.cos(a) * r1, base, Math.sin(a) * r1), p2 = proj(R, v, Math.cos(a) * r2, base, Math.sin(a) * r2);
+    ov.moveTo(p1[0], p1[1]); ov.lineTo(p2[0], p2[1]);
+  }
+  ov.stroke();
+  // the axis the signal takes: reading -> layers 1..L -> speaking
+  const xr = sliceX(0, L) - 0.95, xs = sliceX(L - 1, L) + 0.95;
+  strokePts([proj(R, v, xr, 0.2, 0), proj(R, v, xs, 0.2, 0)], 'rgba(240,195,106,0.1)', DPR);
+  // slice frames: each layer's cortex arch outline (static)
+  for (let l = 0; l < L; l++) {
+    const env = envelope(l, L), x0 = sliceX(l, L), pts = [];
+    for (let q = 0; q <= 40; q++) { const phi = (0.1 + 0.8 * q / 40) * Math.PI, rad = env * 0.86; pts.push(proj(R, v, x0, -0.22 + rad * Math.sin(phi), rad * Math.cos(phi) * 1.12)); }
+    strokePts(pts, 'rgba(240,195,106,0.1)', DPR);
+  }
+  // READING: the input ring; its 16 ticks are the glance's place code, lit for the place this digit has
+  const ev = reading;
+  const rp = readPulse;
+  strokePts(ring3(R, v, xr, 0.2, 0, 0.42, 'yz', 64), `rgba(255,205,120,${0.25 + 0.6 * rp})`, (1 + 1.5 * rp) * DPR);
+  strokePts(ring3(R, v, xr, 0.2, 0, 0.5, 'yz', 64), 'rgba(240,195,106,0.1)', DPR);
+  for (let q = 0; q < 16; q++) {
+    const a = Math.PI / 2 - q / 16 * Math.PI * 2;
+    const on = ev && ev.place === q;
+    const p1 = proj(R, v, xr, 0.2 + Math.sin(a) * 0.5, Math.cos(a) * 0.5), p2 = proj(R, v, xr, 0.2 + Math.sin(a) * (on ? 0.66 : 0.56), Math.cos(a) * (on ? 0.66 : 0.56));
+    ov.strokeStyle = on ? `rgba(255,236,190,${0.4 + 0.6 * rp})` : 'rgba(240,195,106,0.2)'; ov.lineWidth = (on ? 2.5 : 1) * DPR;
+    ov.beginPath(); ov.moveTo(p1[0], p1[1]); ov.lineTo(p2[0], p2[1]); ov.stroke();
+  }
+  if (ev) {
+    const [cx, cy] = proj(R, v, xr, 0.2, 0);
+    ov.textAlign = 'center';
+    ov.font = `300 ${Math.round(20 * DPR)}px Segoe UI, system-ui, sans-serif`;
+    ov.fillStyle = `rgba(255,240,205,${0.55 + 0.45 * rp})`;
+    const tt = ev.kind === 1 ? '¶' : ev.text === '\n' ? '⏎' : ev.text.trim() || '␣';
+    ov.fillText(tt.length > 12 ? tt.slice(0, 11) + '…' : tt, cx, cy + 7 * DPR);
+    ov.font = `${Math.round(9.5 * DPR)}px ui-monospace, Consolas, monospace`; ov.fillStyle = 'rgba(176,148,104,0.9)';
+    const glance = ev.kind === 2 ? 'length mark' : ev.place != null ? `place ${ev.place}` + (ev.mag != null ? ` · magnitude ${ev.mag}` : '') : ev.mag != null ? `magnitude ${ev.mag}` : '';
+    if (glance) ov.fillText(glance, cx, cy + 24 * DPR);
+  }
+  // SPEAKING: the output ring; five radial bars = her top-5 guesses' probabilities
+  const sp = sayPulse;
+  strokePts(ring3(R, v, xs, 0.2, 0, 0.42, 'yz', 64), `rgba(255,205,120,${0.25 + 0.6 * sp})`, (1 + 1.5 * sp) * DPR);
+  strokePts(ring3(R, v, xs, 0.2, 0, 0.5, 'yz', 64), 'rgba(240,195,106,0.1)', DPR);
+  if (ev && ev.p) {
+    ev.p.forEach(([, p], q) => {
+      const a = Math.PI / 2 - (q + 0.5) / 5 * Math.PI * 0.9 + Math.PI * 0.05 - Math.PI / 2 + Math.PI / 2;
+      const p1 = proj(R, v, xs, 0.2 + Math.sin(a) * 0.5, Math.cos(a) * 0.5), p2 = proj(R, v, xs, 0.2 + Math.sin(a) * (0.5 + 0.45 * p), Math.cos(a) * (0.5 + 0.45 * p));
+      ov.strokeStyle = `rgba(255,226,170,${0.35 + 0.65 * p})`; ov.lineWidth = 3 * DPR;
+      ov.beginPath(); ov.moveTo(p1[0], p1[1]); ov.lineTo(p2[0], p2[1]); ov.stroke();
+    });
+    if (ev.phase === 'say') {
+      const [cx, cy] = proj(R, v, xs, 0.2, 0);
+      ov.textAlign = 'center'; ov.font = `300 ${Math.round(20 * DPR)}px Segoe UI, system-ui, sans-serif`;
+      ov.fillStyle = `rgba(255,240,205,${0.55 + 0.45 * sp})`;
+      const tt = ev.text === '\n' ? '⏎' : ev.text.trim() || '␣';
+      ov.fillText(tt.length > 12 ? tt.slice(0, 11) + '…' : tt, cx, cy + 7 * DPR);
+    }
+  }
+  // LOOK-BACK: the engram node in its layer, and arcs from it to the earlier words it reads in the transcript
+  if (M.engram != null) {
+    const [ex, ey, ez] = memCenter(M.engram, L);
+    strokePts(ring3(R, v, ex, ey + 0.42, ez, 0.08, 'yz', 32), 'rgba(240,195,106,0.4)', DPR);
+    const [nx, ny] = proj(R, v, ex, ey + 0.42, ez);
+    const trBox = $('transcript');
+    for (const a of arcs) {
+      const s = trBox.querySelector(`span[data-pos="${a.p}"]`);
+      if (!s) continue;
+      const r = s.getBoundingClientRect(), br = trBox.getBoundingClientRect();
+      if (r.bottom < br.top || r.top > br.bottom) continue;
+      const age = t - a.born, alpha = Math.min(1, 0.3 + 2 * a.w) * Math.exp(-age / 0.5);
+      if (alpha < 0.02) continue;
+      const tx = (r.left + r.width / 2) * DPR, ty = r.top * DPR;
+      ov.strokeStyle = `rgba(255,222,150,${alpha})`; ov.lineWidth = (0.7 + 5 * a.w) * DPR;
+      ov.beginPath(); ov.moveTo(nx, ny); ov.bezierCurveTo(nx, ny + (ty - ny) * 0.5, tx, ty - (ty - ny) * 0.4, tx, ty); ov.stroke();
+    }
+  }
+  ov.restore();
+  // region labels (JARVIS style call-outs)
+  const lx = sliceX(L - 1, L), mid = Math.floor(L / 2);
+  label(R, v, xr, 0.72, 0, 'READING', 'the token arriving · glance', -40, -46);
+  label(R, v, lx, -0.22 + envelope(L - 1, L) * 1.2, 0, 'CORTEX', `${L} spiking layers · ${G.d} LIF neurons each`, 40, -40);
+  label(R, v, ...memCenter(mid, L), 'MEMORY', `fast synapses · ${G.nh} heads per layer`, 70, -64);
+  label(R, v, sliceX(mid, L), -0.66, 0.78 * envelope(mid, L), 'THINKING', `kWTA · ${G.H} units per layer, k=${M.k}`, -60, 46);
+  if (M.engram != null) { const [ex, ey, ez] = memCenter(M.engram, L); label(R, v, ex, ey + 0.42, ez, 'LOOK-BACK', `engram · layer ${M.engram + 1}`, 50, -96); }
+  label(R, v, xs, 0.72, 0, 'SPEAKING', 'her next-token guesses', 40, -46);
+}
+
+// ------------------------------------------------------------------ frame loop
+let last = performance.now(), fpsAcc = 0, fpsN = 0;
+function frame(now) {
+  const dt = Math.min(0.1, (now - last) / 1000); last = now;
+  const t = now / 1000;
+  if (!dragging && t - userRot > 6) { autoT += dt; yaw += (-0.55 + 0.42 * Math.sin(autoT * 0.11) - yaw) * Math.min(1, dt * 0.8); }
+  if (G) {
+    const f = Math.exp(-dt / TAU), h = G.heat;
+    for (let i = 0; i < h.length; i++) h[i] *= f;
+  }
+  readPulse *= Math.exp(-dt / 0.25); sayPulse *= Math.exp(-dt / 0.25);
+  const R = rot(), v = view();
+  if (gl) {
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    if (G) {
+      gl.useProgram(prog); gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+      gl.uniformMatrix3fv(U.uRot, false, new Float32Array([R[0], R[3], R[6], R[1], R[4], R[7], R[2], R[5], R[8]]));
+      gl.uniform2f(U.uScale, v.sx, v.sy); gl.uniform1f(U.uOffY, v.offY); gl.uniform1f(U.uDist, DIST);
+      gl.uniform1f(U.uPx, DPR * Math.max(0.9, Math.sqrt(Math.min(W, H) / DPR / 900)) * zoom);
+      const bind = (buf, a, size) => { gl.bindBuffer(gl.ARRAY_BUFFER, buf); gl.enableVertexAttribArray(a); gl.vertexAttribPointer(a, size, gl.FLOAT, false, 0, 0); };
+      bind(bPos, A.aPos, 3); bind(bInfo, A.aInfo, 2);
+      gl.bindBuffer(gl.ARRAY_BUFFER, bHeat); gl.bufferSubData(gl.ARRAY_BUFFER, 0, G.heat); bind(bHeat, A.aHeat, 2);
+      gl.drawArrays(gl.POINTS, 0, G.n);
+    }
+    drawOverlay(R, v, t);
+  } else {
+    drawOverlay(R, v, t);
+    if (G) {
+      ov.save(); ov.globalCompositeOperation = 'lighter';
+      for (let i = 0; i < G.n; i++) {
+        const [x, y, z, s] = proj(R, v, G.pos[i * 3], G.pos[i * 3 + 1], G.pos[i * 3 + 2]);
+        const hh = G.heat[i * 2], reg = G.info[i * 2], r = (reg === 0 ? 6 : reg === 1 ? 2.5 : 7) * hh * DPR * s + DPR * (reg === 2 ? 1.5 : 0.6);
+        ov.fillStyle = hh > 0.02 ? `rgba(255,${reg === 0 ? 160 : 225},${reg === 0 ? 50 : 170},${Math.min(1, hh)})` : `rgba(240,160,60,${reg === 1 ? 0.06 : 0.18})`;
+        ov.fillRect(x - r, y - r, 2 * r, 2 * r);
+      }
+      ov.restore();
+    }
+  }
+  fpsAcc += dt; fpsN++;
+  if (fpsAcc > 0.5) {
+    window.__fps = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0;
+    const tn = clock(); while (tokTimes.length && tn - tokTimes[0] > 2) tokTimes.shift();
+    $('mRate').textContent = tokTimes.length > 1 ? `${((tokTimes.length - 1) / Math.max(0.05, tokTimes[tokTimes.length - 1] - tokTimes[0])).toFixed(1)} tok/s` : 'resting';
+  }
+  requestAnimationFrame(frame);
+}
+
+// ------------------------------------------------------------------ input
+let dragging = false, lx = 0, ly = 0;
+stage.addEventListener('pointerdown', (e) => { dragging = true; lx = e.clientX; ly = e.clientY; stage.classList.add('drag'); stage.setPointerCapture(e.pointerId); });
+stage.addEventListener('pointermove', (e) => {
+  if (!dragging) return;
+  yaw += (e.clientX - lx) * 0.006; pitch = Math.max(-1.2, Math.min(1.2, pitch + (e.clientY - ly) * 0.006));
+  lx = e.clientX; ly = e.clientY; userRot = performance.now() / 1000;
+});
+const endDrag = () => { dragging = false; stage.classList.remove('drag'); };
+stage.addEventListener('pointerup', endDrag); stage.addEventListener('pointercancel', endDrag);
+stage.addEventListener('wheel', (e) => { e.preventDefault(); zoom = Math.max(0.5, Math.min(2.5, zoom * Math.exp(-e.deltaY * 0.001))); }, { passive: false });
+window.addEventListener('keydown', (e) => { if (e.target.tagName === 'INPUT') return; if (e.key === 'r' || e.key === 'R') { yaw = -0.55; pitch = 0.28; zoom = 1; userRot = -1e9; } });
+window.addEventListener('resize', resize);
+
+initGL(); resize();
+// before "hello" arrives: the regions of a v41-shaped brain at rest (no activity)
+onHello({ model: { name: '–', kind: 'D', d: 384, layers: 8, hidden: 1536, k: 192, heads: 12, engram: 4, glance: true, params: 0 }, device: '–', threads: '–', pace_ms: '–', busy: false });
+setStatus('CONNECTING', false);
+connect();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

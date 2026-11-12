@@ -1,0 +1,10 @@
+# TESTING / DESIGN ONLY: the always-online learner's plumbing (Wave 4 of v42). std only.
+[package]
+name = "ava_online"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+# Detached from any parent workspace, like the other nn crates.
+[workspace]

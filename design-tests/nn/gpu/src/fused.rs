@@ -279,13 +279,21 @@ const ATTN_ROWS: u32 = 32;
 /// softmax(q kᵀ · scale + causal mask) v for q, k, v [B, H, T, 32], without storing the [T, T] scores.
 /// Same maths as the candle chain; the backward recomputes the scores from the saved log-sum-exp.
 pub fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
-    let both = q.contiguous()?.apply_op3(&k.contiguous()?, &v.contiguous()?, Attn { scale: scale as f32 })?;
+    let both = q.contiguous()?.apply_op3(&k.contiguous()?, &v.contiguous()?, Attn { scale: scale as f32, strict: false })?;
+    both.narrow(3, 0, ATTN_HS)
+}
+
+/// v42 (B10): causal_attention over strictly earlier keys only (j < i); row 0 reads nothing (0).
+pub fn causal_attention_strict(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
+    let both = q.contiguous()?.apply_op3(&k.contiguous()?, &v.contiguous()?, Attn { scale: scale as f32, strict: true })?;
     both.narrow(3, 0, ATTN_HS)
 }
 
 /// Output [B, H, T, 33]: the attention output (32) then the row's log-sum-exp.
 struct Attn {
     scale: f32,
+    /// keys j < i only (the *_x kernels)
+    strict: bool,
 }
 
 fn attn_dims(l: &Layout) -> Result<(usize, usize)> {
@@ -322,7 +330,7 @@ impl CustomOp3 for Attn {
         let dev = s1.device().clone();
         let (q, k, v) = (view(s1, l1, "attn q")?, view(s2, l2, "attn k")?, view(s3, l3, "attn v")?);
         let out = unsafe { dev.alloc::<f32>(bh * t * (ATTN_HS + 1))? };
-        let func = dev.get_or_load_custom_func("attn_fwd", MODULE, PTX)?;
+        let func = dev.get_or_load_custom_func(if self.strict { "attn_fwd_x" } else { "attn_fwd" }, MODULE, PTX)?;
         let (bhi, ti) = (bh as i32, t as i32);
         let mut lb = func.builder();
         lb.arg(&q).arg(&k).arg(&v).arg(&out).arg(&bhi).arg(&ti).arg(&self.scale);
@@ -332,13 +340,13 @@ impl CustomOp3 for Attn {
     }
 
     fn bwd(&self, q: &Tensor, k: &Tensor, v: &Tensor, res: &Tensor, gres: &Tensor) -> Result<(Option<Tensor>, Option<Tensor>, Option<Tensor>)> {
-        let (dq, dk, dv) = attn_bwd(q, k, v, res, &gres.narrow(3, 0, ATTN_HS)?, self.scale)?;
+        let (dq, dk, dv) = attn_bwd(q, k, v, res, &gres.narrow(3, 0, ATTN_HS)?, self.scale, self.strict)?;
         Ok((Some(dq), Some(dk), Some(dv)))
     }
 }
 
 /// (dq, dk, dv) of causal_attention for the output gradient `dout` [B, H, T, 32]. Deterministic (no atomics).
-fn attn_bwd(q: &Tensor, k: &Tensor, v: &Tensor, res: &Tensor, dout: &Tensor, scale: f32) -> Result<(Tensor, Tensor, Tensor)> {
+fn attn_bwd(q: &Tensor, k: &Tensor, v: &Tensor, res: &Tensor, dout: &Tensor, scale: f32, strict: bool) -> Result<(Tensor, Tensor, Tensor)> {
     let (q, k, v, res, dout) = (q.contiguous()?, k.contiguous()?, v.contiguous()?, res.contiguous()?, dout.contiguous()?);
     let shape = q.shape().clone();
     let (bh, t) = attn_dims(q.layout())?;
@@ -359,11 +367,11 @@ fn attn_bwd(q: &Tensor, k: &Tensor, v: &Tensor, res: &Tensor, dout: &Tensor, sca
     let dv = unsafe { dev.alloc::<f32>(n)? };
     let dvec = unsafe { dev.alloc::<f32>(bh * t)? };
     let (bhi, ti) = (bh as i32, t as i32);
-    let fq = dev.get_or_load_custom_func("attn_bwd_q", MODULE, PTX)?;
+    let fq = dev.get_or_load_custom_func(if strict { "attn_bwd_q_x" } else { "attn_bwd_q" }, MODULE, PTX)?;
     let mut lb = fq.builder();
     lb.arg(&qv).arg(&kv).arg(&vv).arg(&rv).arg(&dov).arg(&dq).arg(&dvec).arg(&bhi).arg(&ti).arg(&scale);
     unsafe { lb.launch(attn_cfg(bh, t)) }.w()?;
-    let fkv = dev.get_or_load_custom_func("attn_bwd_kv", MODULE, PTX)?;
+    let fkv = dev.get_or_load_custom_func(if strict { "attn_bwd_kv_x" } else { "attn_bwd_kv" }, MODULE, PTX)?;
     let mut lb = fkv.builder();
     lb.arg(&qv).arg(&kv).arg(&vv).arg(&rv).arg(&dov).arg(&dvec).arg(&dk).arg(&dv).arg(&bhi).arg(&ti).arg(&scale);
     unsafe { lb.launch(attn_cfg(bh, t)) }.w()?;
@@ -546,12 +554,12 @@ impl CustomOp2 for GeluBwd {
 
 /// causal_attention without autograd: [B, H, T, 33] (output, then the row log-sum-exp), for attn_bwd_raw.
 pub fn causal_attention_raw(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
-    q.contiguous()?.apply_op3_no_bwd(&k.contiguous()?, &v.contiguous()?, &Attn { scale: scale as f32 })
+    q.contiguous()?.apply_op3_no_bwd(&k.contiguous()?, &v.contiguous()?, &Attn { scale: scale as f32, strict: false })
 }
 
 /// (dq, dk, dv) for the output gradient `dout` [B, H, T, 32]; `res` from causal_attention_raw.
 pub fn attn_bwd_raw(q: &Tensor, k: &Tensor, v: &Tensor, res: &Tensor, dout: &Tensor, scale: f64) -> Result<(Tensor, Tensor, Tensor)> {
-    attn_bwd(q, k, v, res, dout, scale as f32)
+    attn_bwd(q, k, v, res, dout, scale as f32, false)
 }
 
 // ---------------------------------------------------------------- bf16 matmul (speed round 7)
@@ -895,6 +903,36 @@ pub fn attn_bwd_s(qkv: &Tensor, o: &Tensor, lse: &Tensor, dout: &Tensor, b: usiz
     Ok(wrap_bf16(dqkv, dev, &Shape::from((b * t, 3 * d))))
 }
 
+/// v51 fast1 (runs/v51/prereg_v51.md Amendment F-1): `attn_bwd_s` with dqkv [B*T, 3D] in f32, for the f32 training
+/// steps (the bf16 store cost their engram gradients about 1e-3 against an f64 reference). The same kernels' maths.
+pub fn attn_bwd_sf(qkv: &Tensor, o: &Tensor, lse: &Tensor, dout: &Tensor, b: usize, t: usize, scale: f64) -> Result<Tensor> {
+    let d = qkv.dim(1)? / 3;
+    let h = d / ATTN_HS;
+    let (qkv, o, lse, dout) = (qkv.contiguous()?, o.contiguous()?, lse.contiguous()?, dout.contiguous()?);
+    let (qs, ql) = qkv.storage_and_layout();
+    let (os, ol) = o.storage_and_layout();
+    let (ls, ll) = lse.storage_and_layout();
+    let (ds, dl) = dout.storage_and_layout();
+    let (Storage::Cuda(qs), Storage::Cuda(os), Storage::Cuda(ls), Storage::Cuda(ds)) = (&*qs, &*os, &*ls, &*ds) else {
+        candle_core::bail!("attn_bwd_sf: CUDA only");
+    };
+    let dev = qs.device().clone();
+    let (qv, ov) = (view(qs, ql, "attn_bwd_sf qkv")?, view(os, ol, "attn_bwd_sf o")?);
+    let (lv, dv) = (view(ls, ll, "attn_bwd_sf lse")?, view(ds, dl, "attn_bwd_sf dout")?);
+    let dqkv = unsafe { dev.alloc::<f32>(b * t * 3 * d)? };
+    let dvec = unsafe { dev.alloc::<f32>(b * h * t)? };
+    let (hi, ti, di, sc) = (h as i32, t as i32, d as i32, scale as f32);
+    let fq = dev.get_or_load_custom_func("attn_bwd_q_sf", MODULE, PTX)?;
+    let mut lb = fq.builder();
+    lb.arg(&qv).arg(&ov).arg(&lv).arg(&dv).arg(&dqkv).arg(&dvec).arg(&hi).arg(&ti).arg(&di).arg(&sc);
+    unsafe { lb.launch(attn_cfg(b * h, t)) }.w()?;
+    let fkv = dev.get_or_load_custom_func("attn_bwd_kv_sf", MODULE, PTX)?;
+    let mut lb = fkv.builder();
+    lb.arg(&qv).arg(&lv).arg(&dv).arg(&dvec).arg(&dqkv).arg(&hi).arg(&ti).arg(&di).arg(&sc);
+    unsafe { lb.launch(attn_cfg(b * h, t)) }.w()?;
+    Ok(Tensor::from_storage(Storage::Cuda(CudaStorage::wrap_cuda_slice(dqkv, dev)), (b * t, 3 * d), BackpropOp::none(), false))
+}
+
 // ---------------------------------------------------------------- tensor-core attention (speed round 9)
 
 /// A contiguous bf16 input starting on a 16-byte boundary (the tensor-core kernels read 8 values at a time).
@@ -1148,11 +1186,11 @@ pub const HEBB_CK: usize = 16;
 /// head-normed and times silu(g); ck holds the state every HEBB_CK steps for hebb_bwd_raw. The same maths as model.rs
 /// hebb() for D, without autograd.
 pub fn hebb_fwd_per_token(p: &Tensor, cst: &Tensor, b: usize, t: usize, nh: usize, eps: f64) -> Result<(Tensor, Tensor)> {
-    hebb_fwd_pt(p, cst, b, t, nh, eps, false)
+    hebb_fwd_pt(p, cst, b, t, nh, eps, false, false)
 }
 
 /// v40: hebb_fwd_per_token with O as f32, or as bf16 if `bf` (hebb_fwd_b: f2bf of the same values).
-fn hebb_fwd_pt(p: &Tensor, cst: &Tensor, b: usize, t: usize, nh: usize, eps: f64, bf: bool) -> Result<(Tensor, Tensor)> {
+fn hebb_fwd_pt(p: &Tensor, cst: &Tensor, b: usize, t: usize, nh: usize, eps: f64, bf: bool, sg: bool) -> Result<(Tensor, Tensor)> {
     let (p, cst) = (p.contiguous()?, cst.contiguous()?);
     let d = nh * ATTN_HS;
     let ld = 4 * d + 2 * nh;
@@ -1169,7 +1207,8 @@ fn hebb_fwd_pt(p: &Tensor, cst: &Tensor, b: usize, t: usize, nh: usize, eps: f64
     let nck = t.div_ceil(HEBB_CK);
     let o = OutBuf::alloc(&dev, b * t * d, bf)?;
     let ck = unsafe { dev.alloc::<f32>(b * nh * nck * ATTN_HS * ATTN_HS)? };
-    let func = dev.get_or_load_custom_func(if bf { "hebb_fwd_b" } else { "hebb_fwd" }, MODULE, PTX)?;
+    let name = format!("{}{}", if bf { "hebb_fwd_b" } else { "hebb_fwd" }, if sg { "_sg" } else { "" }); // v44 K2: _sg, the sigmoid gate
+    let func = dev.get_or_load_custom_func(&name, MODULE, PTX)?;
     let (bi, hi, ti, ldi, e) = (b as i32, nh as i32, t as i32, ld as i32, eps as f32);
     let mut lb = func.builder();
     lb.arg(&pv).arg(&cv);
@@ -1191,13 +1230,13 @@ pub fn hebb_bwd_per_token(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b
 /// v40: hebb_bwd_per_token with the kernel chosen: hebb_bwd_w1 (one head per block) if `w1`, else hebb_bwd.
 #[allow(clippy::too_many_arguments)]
 pub fn hebb_bwd_per_token_k(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b: usize, t: usize, nh: usize, eps: f64, w1: bool) -> Result<Tensor> {
-    Ok(hebb_bwd_pt(p, cst, ck, d_o, b, t, nh, eps, w1, false)?.0)
+    Ok(hebb_bwd_pt(p, cst, ck, d_o, b, t, nh, eps, w1, false, false)?.0)
 }
 
 /// v40: hebb_bwd_per_token_k with dP as f32 (dz None), or if `bf` as bf16 (f2bf of the same values) with dza, dzb
 /// in f32 apart (dz [N, 2H]).
 #[allow(clippy::too_many_arguments)]
-fn hebb_bwd_pt(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b: usize, t: usize, nh: usize, eps: f64, w1: bool, bf: bool) -> Result<(Tensor, Option<Tensor>)> {
+fn hebb_bwd_pt(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b: usize, t: usize, nh: usize, eps: f64, w1: bool, bf: bool, sg: bool) -> Result<(Tensor, Option<Tensor>)> {
     let (p, cst, ck, d_o) = (p.contiguous()?, cst.contiguous()?, ck.contiguous()?, d_o.contiguous()?);
     let d = nh * ATTN_HS;
     let ld = 4 * d + 2 * nh;
@@ -1224,7 +1263,8 @@ fn hebb_bwd_pt(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b: usize, t:
         (true, true) => "hebb_bwd_w1_bf",
         (false, true) => "hebb_bwd_bf",
     };
-    let fb = dev.get_or_load_custom_func(name, MODULE, PTX)?;
+    let name = format!("{name}{}", if sg { "_sg" } else { "" }); // v44 K2
+    let fb = dev.get_or_load_custom_func(&name, MODULE, PTX)?;
     let mut lb = fb.builder();
     lb.arg(&pv).arg(&cv).arg(&kv).arg(&scratch).arg(&dv);
     dp.push(&mut lb);
@@ -1265,9 +1305,9 @@ pub fn hebb_bwd_raw(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b: usiz
 /// hebb_fwd_raw gives, without the f32 O and its cast. Chunk form or per-token kernel as hebb_fwd_raw.
 pub fn hebb_fwd_raw_b(p: &Tensor, cst: &Tensor, b: usize, t: usize, nh: usize, eps: f64) -> Result<(Tensor, Tensor)> {
     if hebb_use_chunk(p.device(), b, nh)? {
-        hebc_fwd(p, cst, b, t, nh, eps, true)
+        hebc_fwd(p, cst, b, t, nh, eps, true, false)
     } else {
-        hebb_fwd_pt(p, cst, b, t, nh, eps, true)
+        hebb_fwd_pt(p, cst, b, t, nh, eps, true, false)
     }
 }
 
@@ -1276,17 +1316,50 @@ pub fn hebb_fwd_raw_b(p: &Tensor, cst: &Tensor, b: usize, t: usize, nh: usize, e
 /// gradients. Returns (dP bf16, dz).
 pub fn hebb_bwd_raw_b(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b: usize, t: usize, nh: usize, eps: f64) -> Result<(Tensor, Tensor)> {
     let (dp, dz) = if hebb_use_chunk(p.device(), b, nh)? {
-        hebc_bwd(p, cst, ck, d_o, b, t, nh, eps, true)?
+        hebc_bwd(p, cst, ck, d_o, b, t, nh, eps, true, false)?
     } else {
-        hebb_bwd_pt(p, cst, ck, d_o, b, t, nh, eps, hebb_bwd_w1_on(), true)?
+        hebb_bwd_pt(p, cst, ck, d_o, b, t, nh, eps, hebb_bwd_w1_on(), true, false)?
     };
     Ok((dp, dz.expect("bf16 dP comes with dz")))
+}
+
+/// v44 K2: hebb_fwd_raw (`bf` false) or hebb_fwd_raw_b (`bf` true) with the output gate chosen: `sg` true is the
+/// sigmoid gate, O = y·r·sigmoid(g), where p's gate columns hold g = h·Wd·Wu; `sg` false is exactly the call named.
+#[allow(clippy::too_many_arguments)]
+pub fn hebb_fwd_raw_g(p: &Tensor, cst: &Tensor, b: usize, t: usize, nh: usize, eps: f64, bf: bool, sg: bool) -> Result<(Tensor, Tensor)> {
+    if !sg {
+        return if bf { hebb_fwd_raw_b(p, cst, b, t, nh, eps) } else { hebb_fwd_raw(p, cst, b, t, nh, eps) };
+    }
+    if hebb_use_chunk(p.device(), b, nh)? {
+        hebc_fwd(p, cst, b, t, nh, eps, bf, true)
+    } else {
+        hebb_fwd_pt(p, cst, b, t, nh, eps, bf, true)
+    }
+}
+
+/// v44 K2: hebb_bwd_raw (`bf` false: dP f32, dz None) or hebb_bwd_raw_b (`bf` true: dP bf16 and dz) with the output
+/// gate chosen as in hebb_fwd_raw_g; dP's gate columns are then dO·yn·s(1 − s), s = sigmoid(g).
+#[allow(clippy::too_many_arguments)]
+pub fn hebb_bwd_raw_g(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b: usize, t: usize, nh: usize, eps: f64, bf: bool, sg: bool) -> Result<(Tensor, Option<Tensor>)> {
+    if !sg {
+        return if bf {
+            let (dp, dz) = hebb_bwd_raw_b(p, cst, ck, d_o, b, t, nh, eps)?;
+            Ok((dp, Some(dz)))
+        } else {
+            Ok((hebb_bwd_raw(p, cst, ck, d_o, b, t, nh, eps)?, None))
+        };
+    }
+    if hebb_use_chunk(p.device(), b, nh)? {
+        hebc_bwd(p, cst, ck, d_o, b, t, nh, eps, bf, true)
+    } else {
+        hebb_bwd_pt(p, cst, ck, d_o, b, t, nh, eps, hebb_bwd_w1_on(), bf, true)
+    }
 }
 
 /// v40: the per-token kernel of hebb_bwd_raw_b, with the kernel chosen as in hebb_bwd_per_token_k (for tests).
 #[allow(clippy::too_many_arguments)]
 pub fn hebb_bwd_per_token_b(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b: usize, t: usize, nh: usize, eps: f64, w1: bool) -> Result<(Tensor, Tensor)> {
-    let (dp, dz) = hebb_bwd_pt(p, cst, ck, d_o, b, t, nh, eps, w1, true)?;
+    let (dp, dz) = hebb_bwd_pt(p, cst, ck, d_o, b, t, nh, eps, w1, true, false)?;
     Ok((dp, dz.expect("bf16 dP comes with dz")))
 }
 
@@ -1377,11 +1450,11 @@ fn per_head(heads: usize) -> LaunchConfig {
 /// v38: hebb_fwd_raw in the chunk form of the gated delta rule (lif.cu hc_prep, hc_scan, hc_out): the same inputs and
 /// outputs, the same maths to rounding, and ck is the same tensor (the state entering every 16-token chunk).
 pub fn hebc_fwd_raw(p: &Tensor, cst: &Tensor, b: usize, t: usize, nh: usize, eps: f64) -> Result<(Tensor, Tensor)> {
-    hebc_fwd(p, cst, b, t, nh, eps, false)
+    hebc_fwd(p, cst, b, t, nh, eps, false, false)
 }
 
 /// v40: hebc_fwd_raw with O as f32, or as bf16 if `bf` (hc_out_b: f2bf of the same values).
-fn hebc_fwd(p: &Tensor, cst: &Tensor, b: usize, t: usize, nh: usize, eps: f64, bf: bool) -> Result<(Tensor, Tensor)> {
+fn hebc_fwd(p: &Tensor, cst: &Tensor, b: usize, t: usize, nh: usize, eps: f64, bf: bool, sg: bool) -> Result<(Tensor, Tensor)> {
     let (p, cst) = (p.contiguous()?, cst.contiguous()?);
     let d = nh * ATTN_HS;
     let ld = 4 * d + 2 * nh;
@@ -1418,7 +1491,8 @@ fn hebc_fwd(p: &Tensor, cst: &Tensor, b: usize, t: usize, nh: usize, eps: f64, b
     hc_prof(&dev, "hc_scan")?;
     drop((u, w, kd, gc));
     let o = OutBuf::alloc(&dev, b * t * d, bf)?;
-    let fo = dev.get_or_load_custom_func(if bf { "hc_out_b" } else { "hc_out" }, MODULE, PTX)?;
+    let name = format!("{}{}", if bf { "hc_out_b" } else { "hc_out" }, if sg { "_sg" } else { "" }); // v44 K2
+    let fo = dev.get_or_load_custom_func(&name, MODULE, PTX)?;
     let mut lb = fo.builder();
     lb.arg(&pv).arg(&cv).arg(&dl).arg(&ck);
     o.push(&mut lb);
@@ -1432,13 +1506,13 @@ fn hebc_fwd(p: &Tensor, cst: &Tensor, b: usize, t: usize, nh: usize, eps: f64, b
 
 /// v38: hebb_bwd_raw in the chunk form (lif.cu hc_bout, hc_bscan, hc_bmain). Takes ck from either forward.
 pub fn hebc_bwd_raw(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b: usize, t: usize, nh: usize, eps: f64) -> Result<Tensor> {
-    Ok(hebc_bwd(p, cst, ck, d_o, b, t, nh, eps, false)?.0)
+    Ok(hebc_bwd(p, cst, ck, d_o, b, t, nh, eps, false, false)?.0)
 }
 
 /// v40: hebc_bwd_raw with dP as f32 (dz None), or if `bf` as bf16 (hc_bout_b, hc_bmain_b: f2bf of the same values)
 /// with dza, dzb in f32 apart (dz [N, 2H]).
 #[allow(clippy::too_many_arguments)]
-fn hebc_bwd(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b: usize, t: usize, nh: usize, eps: f64, bf: bool) -> Result<(Tensor, Option<Tensor>)> {
+fn hebc_bwd(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b: usize, t: usize, nh: usize, eps: f64, bf: bool, sg: bool) -> Result<(Tensor, Option<Tensor>)> {
     let (p, cst, ck, d_o) = (p.contiguous()?, cst.contiguous()?, ck.contiguous()?, d_o.contiguous()?);
     let d = nh * ATTN_HS;
     let ld = 4 * d + 2 * nh;
@@ -1466,7 +1540,8 @@ fn hebc_bwd(p: &Tensor, cst: &Tensor, ck: &Tensor, d_o: &Tensor, b: usize, t: us
     let x2 = unsafe { dev.alloc::<f32>(nchunks * ATTN_HS * ATTN_HS)? };
     let dp = OutBuf::alloc(&dev, b * t * ld, bf)?;
     let dz = if bf { Some(unsafe { dev.alloc::<f32>(b * t * 2 * nh)? }) } else { None };
-    let f1 = dev.get_or_load_custom_func(if bf { "hc_bout_b" } else { "hc_bout" }, MODULE, PTX)?;
+    let name = format!("{}{}", if bf { "hc_bout_b" } else { "hc_bout" }, if sg { "_sg" } else { "" }); // v44 K2
+    let f1 = dev.get_or_load_custom_func(&name, MODULE, PTX)?;
     let mut lb = f1.builder();
     lb.arg(&pv).arg(&cv).arg(&kv).arg(&dv).arg(&w).arg(&kd).arg(&gc);
     dp.push(&mut lb);

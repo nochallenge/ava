@@ -1,7 +1,7 @@
 // TESTING / DESIGN ONLY — generate_gpu: sample text from a train_gpu checkpoint (model.safetensors).
 //
 // generate_gpu --model FILE [--arch D|S|A|T|F|G|R] --d D --layers L [--ctx 256] [--prompt TEXT] [--tokens 100]
-//              [--temperature 1.0] [--top-k 40] [--seed 1] [--cpu] [--bpe FILE] [--window] [--check] [--qa] [--chat] [--glance]
+//              [--temperature 1.0] [--top-k 40] [--seed 1] [--cpu] [--bpe FILE] [--window] [--check] [--qa] [--chat] [--glance] [--int8]
 //
 // Ava (every kind but T) keeps her LIF membranes and fast weights from token to token (`Model::step`;
 // A also keeps a key/value cache for its attention blocks): each new token costs one
@@ -17,6 +17,8 @@
 //
 // v39 --glance: a model D trained with the glance (vocab 4112). The prompt gets its length marks
 // (ava_data::numbers::insert_marks); she writes her own marks, which are not printed.
+//
+// --int8: the int8 talking path on the CPU (Model::set_int8, src/int8.rs; implies --cpu).
 
 use ava_data::bpe::{Bpe, EOS};
 use ava_data::numbers::{insert_marks, strip_marks};
@@ -27,7 +29,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 const USAGE: &str = "usage: generate_gpu --model FILE [--arch D|S|A|T|F|G|R] --d D --layers L [--ctx 256] [--prompt TEXT] [--tokens 100]\n\
-    \x20               [--temperature 1.0] [--top-k 40] [--seed 1] [--cpu] [--bpe FILE] [--window] [--check] [--qa] [--chat] [--glance]";
+    \x20               [--temperature 1.0] [--top-k 40] [--seed 1] [--cpu] [--bpe FILE] [--window] [--check] [--qa] [--chat] [--glance] [--int8]";
 
 fn main() {
     if let Err(e) = run() {
@@ -46,6 +48,7 @@ fn run() -> Result<(), String> {
     let mut top_k = 40usize;
     let mut seed = 1u64;
     let (mut cpu, mut window, mut check, mut qa, mut chat, mut glance) = (false, false, false, false, false, false);
+    let mut int8 = false;
     let mut bpe_path = PathBuf::from(ava_gpu::DEFAULT_BPE);
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -54,9 +57,10 @@ fn run() -> Result<(), String> {
         if key == "-h" || key == "--help" {
             return Err(USAGE.into());
         }
-        if matches!(key, "--cpu" | "--window" | "--check" | "--qa" | "--chat" | "--glance") {
+        if matches!(key, "--cpu" | "--window" | "--check" | "--qa" | "--chat" | "--glance" | "--int8") {
             match key {
                 "--cpu" => cpu = true,
+                "--int8" => (int8, cpu) = (true, true),
                 "--window" => window = true,
                 "--qa" => qa = true,
                 "--chat" => chat = true,
@@ -92,6 +96,14 @@ fn run() -> Result<(), String> {
     let dev = ava_gpu::device(cpu).map_err(|e| format!("device: {e}"))?;
     let bpe = Bpe::load(&bpe_path).map_err(|e| format!("bpe {}: {e}", bpe_path.display()))?;
     let (cfg, _varmap, model) = ava_gpu::ckpt::load_expect(&model_path, kind, ctx, d, layers, glance, &dev)?;
+    if int8 {
+        model.set_int8(true).map_err(|e| format!("--int8: {e}"))?;
+        // the fused one-token step (src/model/fstep.rs): the same bits, faster; it stays out by itself where it does not apply
+        model.set_fused(true);
+        if let Some(why) = model.fused_blocker() {
+            eprintln!("fused step not used: {why}");
+        }
+    }
 
     if qa || chat {
         // v37: ask her a question in the format she was taught (qa::prompt_text); she answers until her EOS.

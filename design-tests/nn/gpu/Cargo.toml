@@ -8,6 +8,8 @@ description = "TESTING / DESIGN ONLY - Ava-S on candle/CUDA: train_gpu + generat
 
 [dependencies]
 ava_data = { path = "../data" }
+# v42 Wave 2C: the Wave 5 brain parts (design-tests/nn/parts), switched on in a block by arch flags (src/memory.rs)
+ava_parts = { path = "../parts" }
 candle-core = { version = "0.11.0", features = ["cuda"] }
 candle-nn = { version = "0.11.0", features = ["cuda"] }
 # same version and features as candle-core selects; used only by mem_probe to read the CUDA pool's counters

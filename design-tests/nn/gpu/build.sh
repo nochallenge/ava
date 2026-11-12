@@ -10,6 +10,7 @@ export CUDA_COMPUTE_CAP=89
 export CARGO_BUILD_JOBS=6
 export NVCC_APPEND_FLAGS="-Xcompiler /Zc:preprocessor"
 export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=link.exe
-export RUSTFLAGS="-C linker-flavor=msvc"
+# AVA_RUSTFLAGS (v49): extra flags for one build, e.g. "-C target-feature=+crt-static" for the chat app download
+export RUSTFLAGS="-C linker-flavor=msvc${AVA_RUSTFLAGS:+ $AVA_RUSTFLAGS}"
 cd "$(dirname "$0")" || exit 1
 exec cargo "$@"

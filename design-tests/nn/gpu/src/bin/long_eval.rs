@@ -16,6 +16,8 @@
 //   from the tokenizer (length marks are 0 bytes). Differences between conditions get a 95% interval from a
 //   bootstrap over books (--resamples, SplitMix64 seed 1): BPB is a ratio of sums, recomputed per resample.
 // * Last line: RESULT with every condition's BPB of the last bucket.
+// * v52 --fused: every score from the fused forward (eval::score_logits; runs/v52/fasteval.md); a model it does not
+//   take (or the CPU) is scored on the reference forward, and the line after loading says why.
 
 use ava_data::bpe::{Bpe, EOS};
 use ava_data::numbers::insert_marks;
@@ -29,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const USAGE: &str = "usage: long_eval --model FILE (--shards DIR | --text DIR) [--arch D] [--books 100] [--len 16384] [--cut 256]\n\
-    \x20                [--buckets 256,1024,4096,16384] [--baseline FILE] [--resamples 10000] [--out FILE] [--bpe FILE]";
+    \x20                [--buckets 256,1024,4096,16384] [--baseline FILE] [--resamples 10000] [--out FILE] [--bpe FILE] [--fused]";
 
 fn main() {
     if let Err(e) = run() {
@@ -118,7 +120,7 @@ fn token_nll(model: &Model, dev: &Device, books: &[Vec<u32>], win: usize) -> Res
         for r0 in (0..rows).step_by(per) {
             let rn = per.min(rows - r0);
             let idt = Tensor::from_vec(ids[r0 * w..(r0 + rn) * w].to_vec(), (rn, w), dev).map_err(|e| e.to_string())?;
-            let logits = model.forward(&idt).map_err(|e| format!("forward: {e}"))?;
+            let logits = ava_gpu::eval::score_logits(model, &idt).map_err(|e| format!("forward: {e}"))?;
             let lp = candle_nn::ops::log_softmax(&logits, D::Minus1).map_err(|e| e.to_string())?;
             drop(logits);
             let tgt = Tensor::from_vec(tg[r0 * w..(r0 + rn) * w].to_vec(), (rn * w, 1), dev).map_err(|e| e.to_string())?;
@@ -181,6 +183,11 @@ fn run() -> Result<(), String> {
         if key == "-h" || key == "--help" {
             return Err(USAGE.into());
         }
+        if key == "--fused" {
+            ava_gpu::eval::set_fused(true); // v52: the fused forward (eval::score_logits)
+            i += 1;
+            continue;
+        }
         let v = args.get(i + 1).ok_or_else(|| format!("{key} needs a value\n{USAGE}"))?.as_str();
         let num = |v: &str| v.parse::<usize>().map_err(|_| format!("bad integer {v:?}"));
         match key {
@@ -207,6 +214,9 @@ fn run() -> Result<(), String> {
     let dev = ava_gpu::device(false).map_err(|e| format!("device: {e}"))?;
     let bpe = Bpe::load(&bpe_path).map_err(|e| format!("bpe {}: {e}", bpe_path.display()))?;
     let (cfg, _varmap, model) = ava_gpu::ckpt::load_auto(&model_path, kind, 256, &dev)?;
+    if ava_gpu::eval::fused() {
+        println!("{}: {}", model_path.display(), ava_gpu::eval::fused_line(&model, &dev));
+    }
     model.set_track_activity(false);
     model.set_inference(std::env::var("AVA_FAST_INFER").map_or(true, |v| v != "0"));
     let books = match (&shards, &text) {
@@ -242,6 +252,9 @@ fn run() -> Result<(), String> {
     drop(model);
     if let Some(bp) = &baseline {
         let (_, _vb, bm) = ava_gpu::ckpt::load_auto(bp, kind, 256, &dev)?;
+        if ava_gpu::eval::fused() {
+            println!("{}: {}", bp.display(), ava_gpu::eval::fused_line(&bm, &dev));
+        }
         bm.set_track_activity(false);
         bm.set_inference(std::env::var("AVA_FAST_INFER").map_or(true, |v| v != "0"));
         run_cond("base", &bm, len)?;

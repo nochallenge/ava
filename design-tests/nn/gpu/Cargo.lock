@@ -52,11 +52,20 @@ name = "ava_gpu"
 version = "0.1.0"
 dependencies = [
  "ava_data",
+ "ava_parts",
  "candle-core",
  "candle-nn",
  "cudarc 0.19.10",
  "half",
  "serde_json",
+]
+
+[[package]]
+name = "ava_parts"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "candle-nn",
 ]
 
 [[package]]

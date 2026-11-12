@@ -24,6 +24,9 @@
 //
 // v41 --min-kind-items N: the overall accuracy and its interval use only the kinds with at least N items (a kind
 // with 2 items would otherwise weigh as much as one with 400); every kind is still scored and printed. Default 0.
+//
+// v52 --fused: every score from the fused forward (eval::score_logits; runs/v52/fasteval.md); a model it does not take
+// (or the CPU) is scored on the reference forward, and the line after loading says why.
 
 use ava_data::bpe::{Bpe, EOS};
 use ava_data::numbers::insert_marks;
@@ -35,7 +38,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 const USAGE: &str = "usage: num_eval --model FILE --arch D --d 384 --layers 8 --items FILE [--glance [--lesion-place] [--lesion-mag] [--lesion-engram]]\n\
-    \x20               [--baseline FILE [--baseline-glance]] [--out FILE] [--batch 512] [--cpu] [--bpe FILE] [--min-kind-items N]";
+    \x20               [--baseline FILE [--baseline-glance]] [--out FILE] [--batch 512] [--cpu] [--bpe FILE] [--min-kind-items N] [--fused]";
 
 struct Item {
     id: String,
@@ -87,6 +90,9 @@ fn load(path: &PathBuf, kind: Kind, d: usize, layers: usize, glance: bool, lesio
     }
     model.set_track_activity(false);
     model.set_inference(std::env::var("AVA_FAST_INFER").map_or(true, |v| v != "0"));
+    if ava_gpu::eval::fused() {
+        println!("{}: {}", path.display(), ava_gpu::eval::fused_line(&model, dev));
+    }
     Ok(model)
 }
 
@@ -163,6 +169,11 @@ fn run() -> Result<(), String> {
         let key = args[i].as_str();
         if key == "-h" || key == "--help" {
             return Err(USAGE.into());
+        }
+        if key == "--fused" {
+            ava_gpu::eval::set_fused(true); // v52: the fused forward (eval::score_logits)
+            i += 1;
+            continue;
         }
         if matches!(key, "--cpu" | "--glance" | "--baseline-glance" | "--lesion-place" | "--lesion-mag" | "--lesion-engram") {
             match key {

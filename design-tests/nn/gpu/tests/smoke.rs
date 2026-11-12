@@ -1787,3 +1787,114 @@ fn v41_anchor_importance_pull_and_drift() {
     an.pull(0.0).unwrap();
     assert_eq!(vals(a.as_tensor()), vec![9., 8., 7., 6.]);
 }
+
+// ------------------------------------------------------------------------------------------------ brain viewer
+
+/// forward_trace (spike_record's recording pass) gives forward's logits bit for bit, on D with the glance, the
+/// magnitude code and the engram (block 1 of 2) and on plain S; its spikes are 0/1, every kWTA row has exactly k
+/// winners and the hidden activity is 0 off them; the engram's attention is causal with rows summing to 1.
+#[test]
+fn viz_forward_trace_matches_forward() {
+    let dev = device();
+    let (cfg, _vm, model) = v40_model(&dev, 31);
+    let (ids, _) = glance_batch(&dev, 2, 24, 5);
+    let want = model.forward(&ids).unwrap();
+    let (got, tr) = model.forward_trace(&ids).unwrap();
+    assert_eq!(bits_f32(&want), bits_f32(&got), "D: forward_trace logits differ from forward");
+    assert_eq!(tr.layers.len(), cfg.layers);
+    let (n, k) = (2 * 24, cfg.kwta_k());
+    for (i, l) in tr.layers.iter().enumerate() {
+        let s = vals(&l.spikes);
+        assert_eq!(s.len(), n * cfg.d);
+        assert!(s.iter().all(|&v| v == 0.0 || v == 1.0), "layer {i}: spikes not 0/1");
+        let w = vals(&l.winners);
+        let hid = vals(&l.hidden);
+        for r in 0..n {
+            let row = &w[r * cfg.hidden()..(r + 1) * cfg.hidden()];
+            assert!(row.iter().all(|&v| v == 0.0 || v == 1.0));
+            assert_eq!(row.iter().filter(|&&v| v == 1.0).count(), k, "layer {i} row {r}: winners != k");
+            for (j, &m) in row.iter().enumerate() {
+                let a = hid[r * cfg.hidden() + j];
+                assert!(a >= 0.0 && (m == 1.0 || a == 0.0), "layer {i}: hidden activity off the winners");
+            }
+        }
+        assert!(l.hebb_read.is_some() && l.hebb_write.is_some() && l.hebb_keep.is_some(), "D: every block has its memory");
+        assert_eq!(l.engram_attn.is_some(), i == 1, "the engram is in block 1 only");
+        if let Some(e) = &l.engram_attn {
+            let (b, nh, t, t2) = e.dims4().unwrap();
+            assert_eq!((b, nh, t, t2), (2, cfg.heads(), 24, 24));
+            let e = vals(e);
+            for row in e.chunks(24) {
+                assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+            }
+            for (idx, &v) in e.iter().enumerate() {
+                let (qi, kj) = ((idx / 24) % 24, idx % 24);
+                assert!(kj <= qi || v == 0.0, "engram attention reads the future");
+            }
+        }
+    }
+    let (_c, _v, s_model) = tiny(&dev, 3);
+    let (ids, _) = batch(&dev, 2, 16, 9);
+    let (got, tr) = s_model.forward_trace(&ids).unwrap();
+    assert_eq!(bits_f32(&s_model.forward(&ids).unwrap()), bits_f32(&got), "S: forward_trace logits differ from forward");
+    assert!(tr.layers.iter().all(|l| l.hebb_read.is_none() && l.engram_attn.is_none()));
+}
+
+/// step_trace (the live viewer's step) gives step's logits and carried state bit for bit, token after token, on D
+/// with the glance, the magnitude code and the engram (block 1 of 2) and on G; its spikes are 0/1, each block has
+/// exactly k kWTA winners and no hidden activity off them, the memory's norms and gates are finite and in range,
+/// and the engram's attention covers every token so far and sums to 1.
+#[test]
+fn viz_step_trace_matches_step() {
+    let dev = device();
+    let (cfg, _vm, model) = v40_model(&dev, 41);
+    let toks = glance_stream(40, 13);
+    let (mut a, mut b) = (model.stream().unwrap(), model.stream().unwrap());
+    let mut places = 0;
+    for (n, &t) in toks.iter().enumerate() {
+        let want = model.step(&mut a, t).unwrap();
+        let (got, tr) = model.step_trace(&mut b, t).unwrap();
+        assert_eq!(bits_f32(&want), bits_f32(&got), "D token {n}: step_trace logits differ from step");
+        let (sa, sb) = (a.state_tensors(), b.state_tensors());
+        assert_eq!(sa.len(), sb.len());
+        for (x, y) in sa.iter().zip(&sb) {
+            assert_eq!(bits_f32(x), bits_f32(y), "D token {n}: carried state differs");
+        }
+        assert_eq!(a.state_scalars(), b.state_scalars());
+        places += (tr.place < 16) as usize;
+        assert_eq!(tr.layers.len(), cfg.layers);
+        for (i, l) in tr.layers.iter().enumerate() {
+            assert!(vals(&l.spikes).iter().all(|&v| v == 0.0 || v == 1.0), "spikes not 0/1");
+            let w = vals(&l.winners);
+            assert_eq!(w.iter().filter(|&&v| v == 1.0).count(), cfg.kwta_k(), "winners != k");
+            assert!(vals(&l.hidden).iter().zip(&w).all(|(&h, &m)| h >= 0.0 && (m == 1.0 || h == 0.0)));
+            for (name, t, lo, hi) in [("write", &l.mem_write, 0.0, f32::MAX), ("read", &l.mem_read, 0.0, f32::MAX), ("keep", &l.mem_keep, 0.0, 1.0), ("gate", &l.mem_gate, 0.0, 2.0)] {
+                let v = vals(t.as_ref().unwrap_or_else(|| panic!("D block {i}: no {name}")));
+                assert_eq!(v.len(), cfg.heads());
+                assert!(v.iter().all(|&x| x.is_finite() && x >= lo && x <= hi), "{name} out of range: {v:?}");
+            }
+            assert_eq!(l.engram_attn.is_some(), i == 1);
+            if let Some(e) = &l.engram_attn {
+                assert_eq!(e.dims2().unwrap(), (cfg.heads(), n + 1));
+                for row in vals(e).chunks(n + 1) {
+                    assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+                }
+            }
+        }
+    }
+    assert!(places > 0, "the stream has digits with a place code");
+    // G (no delta rule): the same exactness
+    let cfg = Config::with_kind(Kind::G, VOCAB, 64, 2, 32);
+    let varmap = VarMap::new();
+    let g = Model::new(cfg, VarBuilder::from_varmap(&varmap, DType::F32, &dev)).unwrap();
+    let (mut a, mut b) = (g.stream().unwrap(), g.stream().unwrap());
+    for (n, t) in (0..20u32).map(|i| 300 + (i * 37) % 200).enumerate() {
+        let want = g.step(&mut a, t).unwrap();
+        let (got, tr) = g.step_trace(&mut b, t).unwrap();
+        assert_eq!(bits_f32(&want), bits_f32(&got), "G token {n}: logits differ");
+        for (x, y) in a.state_tensors().iter().zip(&b.state_tensors()) {
+            assert_eq!(bits_f32(x), bits_f32(y), "G token {n}: state differs");
+        }
+        assert!(tr.layers.iter().all(|l| l.mem_write.is_some() && l.engram_attn.is_none()));
+    }
+}

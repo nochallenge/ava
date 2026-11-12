@@ -2,7 +2,7 @@
 //
 // mc_eval --model FILE (--items TSV | --set NAME [--passage]) [--arch D] [--lesion place,mag,engram]
 //         [--context FILE] [--baseline FILE [--baseline-lesion LIST] [--baseline-context FILE]]
-//         [--norm total|byte] [--tau X] [--batch-tokens 32768] [--limit N] [--out FILE] [--resamples 20000] [--bpe FILE]
+//         [--norm total|byte|pmi] [--tau X] [--fok C] [--batch-tokens 32768, 4096 with --cpu] [--limit N] [--out FILE] [--resamples 20000] [--bpe FILE]
 //
 // * The model's shape is read from its file (ckpt::load_auto): v39 and v40 files both load, with their glance,
 //   magnitude code and engram; glance models get their length marks (mc::item_seqs).
@@ -10,6 +10,7 @@
 //   (qa::eval_set; closed book unless --passage). Scoring is v37's: total NLL of the choice's tokens and the
 //   closing EOS; right only when the right choice is strictly lowest (a tie is wrong). v41: --norm byte divides
 //   each choice's NLL by its bytes (default total, v37's rule); margins and tau are then in nats per byte.
+//   v42: --norm pmi scores NLL(choice | prompt) − NLL(choice | "Answer:"), one extra batched pass (src/mc.rs).
 // * --context FILE: its text goes before every prompt (a blank line between), e.g. the day's facts for the
 //   sleep test's "awake, facts in view" condition.
 // * --lesion: switch off the place code, the magnitude code and/or the engram read (Model::set_lesion).
@@ -19,7 +20,22 @@
 //   --baseline just before them, so one pass scores every condition and a sealed set is opened once. The paired
 //   bootstrap 95% interval of accuracy (model − baseline) over items (--resamples, SplitMix64 seed 1), overall
 //   and per kind and per bin.
-// * Last line: RESULT n=.. acc=.. [base=.. diff=.. lo=.. hi=..] for chain scripts.
+// * C19 several minds: --mind FILE (repeatable) adds minds to --model. Each answers on its own; their answers are
+//   weighed by how sure each is (mc::group: softmax of −score at its pick, weight ln((K−1)c/(1−c))), after
+//   --debate R rounds in which a mind moves only if the others' weighted support for another answer beats its own.
+//   The group is reported, with a paired bootstrap against --model alone.
+// * A6 study first: --study STEPS,LR takes STEPS plain gradient steps of size LR on each item's prompt (its
+//   next-token loss) before scoring that item, then restores the weights, so nothing carries to the next item.
+//   Only the weights whose names start with --study-params PREFIX move (default: the last block's MLP,
+//   b{L-1}.mlp). Items are then scored one at a time, which is slower. With --mind, every mind studies.
+// * F9 feeling of knowing first: for a model trained with --confidence, the C8 probe reads her state at the
+//   question's last token, before any choice is seen (mc::fok, one batched pass over the prompts). Reported: how well
+//   it tells her right answers from her wrong ones (AUC: 0.5 is chance), its mean on each, its calibration (ECE),
+//   and right − wrong when she answers only at a feeling of knowing >= C (--fok C fixed; without it the best C on
+//   this set is printed, labelled a dev choice, never for a test).
+// * Last line: RESULT n=.. acc=.. [fok_auc=.. fok_rmw=..] [base=.. diff=.. lo=.. hi=..] for chain scripts.
+// * v52 --fused: every score from the fused forward (eval::score_logits; runs/v52/fasteval.md); a model it does not
+//   take (or the CPU) is scored on the reference forward, and the line after loading says why.
 
 use ava_data::bpe::Bpe;
 use ava_gpu::eval::paired_bootstrap;
@@ -32,7 +48,11 @@ use std::time::Instant;
 
 const USAGE: &str = "usage: mc_eval --model FILE (--items TSV | --set NAME [--passage]) [--arch D] [--lesion place,mag,engram]\n\
     \x20              [--context FILE] [--baseline FILE [--baseline-lesion LIST] [--baseline-context FILE]]\n\
-    \x20              [--norm total|byte] [--tau X] [--batch-tokens 32768] [--limit N] [--out FILE] [--resamples 20000] [--bpe FILE]";
+    \x20              [--norm total|byte|pmi] [--tau X] [--fok C] [--batch-tokens 32768, 4096 with --cpu] [--limit N] [--out FILE] [--resamples 20000] [--bpe FILE]\n\
+    \x20              [--mind FILE].. [--debate R] [--study STEPS,LR [--study-params PREFIX]] [--cpu] [--fused]";
+
+/// A6: (steps, lr, the weights' name prefix; None = the last block's MLP).
+type Study = Option<(usize, f64, Option<String>)>;
 
 fn main() {
     if let Err(e) = run() {
@@ -67,18 +87,78 @@ fn read_context(p: &Option<PathBuf>) -> Result<Option<String>, String> {
 }
 
 /// Load, switch off what `lesion` names, and grade every item.
-fn grade_with(path: &PathBuf, kind: Kind, lesion: (bool, bool, bool), items: &[Item], bpe: &Bpe, batch: usize, norm: mc::Norm, dev: &candle_core::Device) -> Result<(Vec<Graded>, f64, String), String> {
-    let (cfg, _varmap, model): (_, _, Model) = ava_gpu::ckpt::load_auto(path, kind, 256, dev)?;
+fn grade_with(path: &PathBuf, kind: Kind, lesion: (bool, bool, bool), items: &[Item], bpe: &Bpe, batch: usize, norm: mc::Norm, dev: &candle_core::Device, study: &Study) -> Result<(Vec<Graded>, f64, String, Option<Vec<f32>>), String> {
+    // scoring only on the CPU: the lean model (ckpt::lean: the same logits bit for bit, without the autograd graph
+    // that held about 2 MB per batched token); --study trains, so it keeps the trainable one
+    let load = if dev.is_cpu() && study.is_none() { ava_gpu::ckpt::load_auto_lean } else { ava_gpu::ckpt::load_auto };
+    let (cfg, varmap, model): (_, _, Model) = load(path, kind, 256, dev)?;
     if (lesion.0 && !cfg.glance) || (lesion.1 && !cfg.mag) || (lesion.2 && cfg.engram.is_none()) {
         return Err(format!("{}: a lesion names a part the model does not have (glance {}, mag {}, engram {:?})", path.display(), cfg.glance, cfg.mag, cfg.engram));
     }
     model.set_track_activity(false);
     model.set_inference(std::env::var("AVA_FAST_INFER").map_or(true, |v| v != "0"));
     model.set_lesion(lesion.0, lesion.1, lesion.2);
+    if ava_gpu::eval::fused() {
+        println!("{}: {}", path.display(), ava_gpu::eval::fused_line(&model, dev));
+    }
     let t0 = Instant::now();
-    let g = mc::grade(&model, dev, bpe, items, cfg.glance, batch, norm)?;
-    let desc = format!("{} (glance {}, mag {}, engram {:?}; off: place {} mag {} engram {})", path.display(), cfg.glance, cfg.mag, cfg.engram, lesion.0, lesion.1, lesion.2);
-    Ok((g, t0.elapsed().as_secs_f64(), desc))
+    // F9: her feeling of knowing on each question, before any choice is seen (None without the C8 probe)
+    let fk = mc::fok(&model, dev, bpe, items, cfg.glance, batch)?;
+    let g = match study {
+        None => mc::grade(&model, dev, bpe, items, cfg.glance, batch, norm)?,
+        Some((steps, lr, prefix)) => {
+            // A6: study each prompt, score that item, put the weights back
+            let prefix = prefix.clone().unwrap_or_else(|| format!("b{}.mlp", cfg.layers - 1));
+            let vars: Vec<candle_core::Var> = varmap.data().lock().unwrap().iter().filter(|(k, _)| k.starts_with(&prefix)).map(|(_, v)| v.clone()).collect();
+            if vars.is_empty() {
+                return Err(format!("--study-params {prefix}: no weight of {} starts with it", path.display()));
+            }
+            let mut g = Vec::with_capacity(items.len());
+            for it in items {
+                let (seqs, from) = mc::item_seqs(bpe, it, cfg.glance);
+                model.set_inference(false);
+                let saved = mc::study(&model, dev, &vars, &seqs[0][..from[0]], *steps, *lr)?;
+                model.set_inference(std::env::var("AVA_FAST_INFER").map_or(true, |v| v != "0"));
+                let r = mc::grade(&model, dev, bpe, std::slice::from_ref(it), cfg.glance, batch, norm);
+                ava_parts::ttt::restore(&vars, &saved).map_err(|e| format!("restore: {e}"))?;
+                g.extend(r?);
+            }
+            g
+        }
+    };
+    let st = study.as_ref().map(|(s, lr, _)| format!("; studied {s} steps at lr {lr}")).unwrap_or_default();
+    let desc = format!("{} (glance {}, mag {}, engram {:?}; off: place {} mag {} engram {}{st})", path.display(), cfg.glance, cfg.mag, cfg.engram, lesion.0, lesion.1, lesion.2);
+    Ok((g, t0.elapsed().as_secs_f64(), desc, fk))
+}
+
+/// F9: the feeling-of-knowing lines (nothing without the probe); returns the RESULT fields.
+fn report_fok(g: &[Graded], fok: Option<&[f32]>, thr: Option<f32>) -> String {
+    let Some(c) = fok else {
+        return String::new();
+    };
+    let right: Vec<bool> = g.iter().map(|x| x.right).collect();
+    let mean = |want: bool| {
+        let v: Vec<f32> = c.iter().zip(&right).filter(|x| *x.1 == want).map(|x| *x.0).collect();
+        v.iter().sum::<f32>() / v.len().max(1) as f32
+    };
+    let auc = mc::fok_auc(g, c);
+    let (t, how) = match thr {
+        Some(t) => (t, "fixed"),
+        None => (ava_parts::confidence::best_threshold(c, &right).0, "best on this set: a dev choice, not for a test"),
+    };
+    let (r, w, a) = mc::with_fok(g, c, t);
+    println!(
+        "  feeling of knowing (before the choices): AUC right vs wrong {auc:.3}; mean {:.3} when right, {:.3} when wrong; ECE {:.3}",
+        mean(true),
+        mean(false),
+        ava_parts::confidence::ece(c, &right, 10)
+    );
+    println!(
+        "  answering only at a feeling of knowing >= {t:.4} ({how}): right {r}, wrong {w}, abstained {a}; right - wrong {}; share right among answers {:.1}%",
+        r as i64 - w as i64,
+        100.0 * r as f64 / (r + w).max(1) as f64
+    );
+    format!(" fok_auc={auc:.4} fok_rmw={}", r as i64 - w as i64)
 }
 
 fn report(name: &str, items: &[Item], g: &[Graded], tau: Option<f64>, secs: f64) {
@@ -118,6 +198,10 @@ fn run() -> Result<(), String> {
     let mut norm = mc::Norm::Total;
     let (mut kind, mut passage, mut tau, mut batch, mut limit, mut resamples) = (Kind::D, false, None::<f64>, 32768usize, None::<usize>, 20000usize);
     let mut bpe_path = PathBuf::from(ava_gpu::DEFAULT_BPE);
+    let mut cpu = false;
+    let mut fok_thr: Option<f32> = None;
+    let mut batch_set = false;
+    let (mut minds, mut rounds, mut study, mut study_params): (Vec<PathBuf>, usize, Option<(usize, f64)>, Option<String>) = (Vec::new(), 0, None, None);
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -125,8 +209,18 @@ fn run() -> Result<(), String> {
         if key == "-h" || key == "--help" {
             return Err(USAGE.into());
         }
+        if key == "--fused" {
+            ava_gpu::eval::set_fused(true); // v52: the fused forward (eval::score_logits)
+            i += 1;
+            continue;
+        }
         if key == "--passage" {
             passage = true;
+            i += 1;
+            continue;
+        }
+        if key == "--cpu" {
+            cpu = true;
             i += 1;
             continue;
         }
@@ -144,16 +238,43 @@ fn run() -> Result<(), String> {
             "--baseline-context" => baseline.last_mut().ok_or("--baseline-context goes after its --baseline")?.2 = Some(v.into()),
             "--norm" => norm = mc::Norm::parse(v)?,
             "--tau" => tau = Some(v.parse::<f64>().map_err(|_| format!("bad number {v:?}"))?),
-            "--batch-tokens" => batch = num(v)?.max(1),
+            "--fok" => fok_thr = Some(v.parse::<f32>().map_err(|_| format!("bad number {v:?}"))?),
+            "--batch-tokens" => {
+                batch = num(v)?.max(1);
+                batch_set = true;
+            }
             "--limit" => limit = Some(num(v)?),
             "--out" => out = Some(v.into()),
             "--resamples" => resamples = num(v)?.max(1),
             "--bpe" => bpe_path = v.into(),
+            "--mind" => minds.push(v.into()),
+            "--debate" => rounds = num(v)?,
+            "--study" => {
+                let (s, l) = v.split_once(',').ok_or_else(|| format!("--study STEPS,LR, not {v:?}"))?;
+                let lr = l.parse::<f64>().map_err(|_| format!("bad number {l:?}"))?;
+                if !(lr > 0.0 && lr.is_finite()) {
+                    return Err(format!("--study: LR must be positive, not {l}"));
+                }
+                study = Some((num(s)?, lr));
+            }
+            "--study-params" => study_params = Some(v.into()),
             _ => return Err(format!("unknown option {key}\n{USAGE}")),
         }
         i += 2;
     }
     let model_path = model_path.ok_or_else(|| format!("--model is required\n{USAGE}"))?;
+    if study_params.is_some() && study.is_none() {
+        return Err("--study-params goes with --study STEPS,LR".into());
+    }
+    if rounds > 0 && minds.is_empty() {
+        return Err("--debate R needs other minds (--mind FILE)".into());
+    }
+    let study: Study = study.map(|(s, l)| (s, l, study_params));
+    for p in &minds {
+        if !p.is_file() {
+            return Err(format!("mind {} is not a file", p.display()));
+        }
+    }
     if !model_path.is_file() {
         return Err(format!("model {} is not a file", model_path.display()));
     }
@@ -168,7 +289,11 @@ fn run() -> Result<(), String> {
     if items.is_empty() {
         return Err("no items".into());
     }
-    let dev = ava_gpu::device(false).map_err(|e| format!("device: {e}"))?;
+    if cpu && !batch_set {
+        // on the CPU 4096-token batches are the fastest, and an everything-on model needs about 2 MB a batched token
+        batch = 4096;
+    }
+    let dev = ava_gpu::device(cpu).map_err(|e| format!("device: {e}"))?;
     let bpe = Bpe::load(&bpe_path).map_err(|e| format!("bpe {}: {e}", bpe_path.display()))?;
     let src = items_path.as_ref().map(|p| p.display().to_string()).or(set.clone()).unwrap_or_default();
     println!("{} items from {src}{}, scoring {}", items.len(), if context.is_some() { " (with --context)" } else { "" }, norm.name());
@@ -181,17 +306,39 @@ fn run() -> Result<(), String> {
         }
         read_context(bc)?;
     }
-    let (g, secs, desc) = grade_with(&model_path, kind, lesion, &its, &bpe, batch, norm, &dev)?;
+    let (g, secs, desc, fk) = grade_with(&model_path, kind, lesion, &its, &bpe, batch, norm, &dev, &study)?;
     report(&format!("model {desc}"), &items, &g, tau, secs);
+    let fok_line = report_fok(&g, fk.as_deref(), fok_thr);
     let acc = g.iter().filter(|x| x.right).count() as f64 / g.len() as f64;
-    let mut result = format!("RESULT n={} acc={acc:.6}", g.len());
+    let mut result = format!("RESULT n={} acc={acc:.6}{fok_line}", g.len());
+    if !minds.is_empty() {
+        // C19: the other minds answer, then the group votes
+        let mut all = vec![g.clone()];
+        let t0 = Instant::now();
+        for p in &minds {
+            let (gm, secs_m, desc_m, fkm) = grade_with(p, kind, lesion, &its, &bpe, batch, norm, &dev, &study)?;
+            report(&format!("mind {desc_m}"), &items, &gm, tau, secs_m);
+            report_fok(&gm, fkm.as_deref(), fok_thr);
+            all.push(gm);
+        }
+        let rights: Vec<usize> = items.iter().map(|it| it.right).collect();
+        let gg = mc::group(&all, &rights, rounds);
+        report(&format!("group of {} minds (weighted vote, {rounds} debate rounds)", all.len()), &items, &gg, tau, t0.elapsed().as_secs_f64());
+        let a: Vec<bool> = gg.iter().map(|x| x.right).collect();
+        let b: Vec<bool> = g.iter().map(|x| x.right).collect();
+        let (m, lo, hi) = paired_bootstrap(&a, &b, resamples, 1);
+        println!("group - model: {:+.2} points [95%: {:+.2}, {:+.2}] ({resamples} paired resamples over items)", 100.0 * m, 100.0 * lo, 100.0 * hi);
+        let accg = a.iter().filter(|&&x| x).count() as f64 / a.len() as f64;
+        result += &format!(" group={accg:.6} gdiff={m:.6} glo={lo:.6} ghi={hi:.6}");
+    }
     let mut gbs: Vec<Vec<Graded>> = Vec::new();
     for (j, (bp, base_lesion, base_context)) in baseline.iter().enumerate() {
         let tag = if j == 0 { String::new() } else { (j + 1).to_string() };
         let its_b = with_context(&items, &read_context(base_context)?);
-        let (gb, secs_b, desc_b) = grade_with(bp, kind, *base_lesion, &its_b, &bpe, batch, norm, &dev)?;
+        let (gb, secs_b, desc_b, fkb) = grade_with(bp, kind, *base_lesion, &its_b, &bpe, batch, norm, &dev, &None)?;
         let cdesc = if base_context.is_some() { " (with --baseline-context)" } else { "" };
         report(&format!("baseline{tag} {desc_b}{cdesc}"), &items, &gb, tau, secs_b);
+        report_fok(&gb, fkb.as_deref(), fok_thr);
         let a: Vec<bool> = g.iter().map(|x| x.right).collect();
         let b: Vec<bool> = gb.iter().map(|x| x.right).collect();
         let (m, lo, hi) = paired_bootstrap(&a, &b, resamples, 1);

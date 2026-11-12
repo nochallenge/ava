@@ -1,0 +1,535 @@
+<!-- TESTING / DESIGN ONLY: Ava's chat app. Talk to her; the hologram brain (BodyParts3D) lights up from her real activity, streamed live by ava_live. -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ava</title>
+<style>
+  :root { --text: #eef3ff; --dim: #8f9bb3; --line: rgba(255,255,255,0.10); }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #000; color: var(--text); overflow: hidden;
+    font: 16px/1.6 "Segoe UI", system-ui, -apple-system, sans-serif; }
+  #gl { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  .top { position: fixed; top: 0; left: 0; right: 0; height: 56px; display: flex; align-items: center;
+    justify-content: space-between; padding: 0 22px; z-index: 3;
+    background: linear-gradient(#000d, #0000); }
+  .name { font-weight: 600; letter-spacing: 0.32em; font-size: 15px; text-transform: uppercase; white-space: nowrap; }
+  .state { display: flex; gap: 8px; align-items: center; color: var(--dim); font-size: 13px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: #39ff88; box-shadow: 0 0 10px #39ff88; }
+  .where { color: var(--dim); font-size: 13px; }
+  #chat { position: fixed; top: 56px; bottom: 110px; left: 0; right: 0; overflow-y: auto; z-index: 2;
+    scrollbar-width: thin; scrollbar-color: #ffffff22 transparent;
+    mask-image: linear-gradient(transparent 0, #000 40px, #000 calc(100% - 20px), transparent 100%); }
+  .col { max-width: 760px; margin: 0 auto; padding: 40px 20px 30px; display: flex; flex-direction: column; gap: 22px; }
+  .msg { max-width: 100%; }
+  .user { align-self: flex-end; max-width: 75%; padding: 10px 16px; border-radius: 18px 18px 4px 18px;
+    background: rgba(40,44,58,0.62); border: 1px solid var(--line); backdrop-filter: blur(10px); }
+  .ava { align-self: flex-start; padding: 12px 16px; border-radius: 14px; background: rgba(0,0,0,0.50);
+    backdrop-filter: blur(6px); text-shadow: 0 0 10px #000; }
+  .ava .who { font-size: 12px; letter-spacing: 0.25em; color: var(--dim); margin-bottom: 2px; }
+  .caret { display: inline-block; width: 8px; height: 1.05em; vertical-align: -2px; margin-left: 2px;
+    background: #ff3df2; box-shadow: 0 0 10px #ff3df2; animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .bar { position: fixed; bottom: 34px; left: 50%; transform: translateX(-50%); width: min(760px, calc(100% - 32px));
+    z-index: 3; display: flex; align-items: center; gap: 10px; padding: 8px 8px 8px 20px; border-radius: 28px;
+    background: rgba(20,22,30,0.72); border: 1px solid rgba(255,255,255,0.14); backdrop-filter: blur(14px); }
+  .bar input { flex: 1; background: none; border: 0; outline: 0; color: var(--text); font: inherit; }
+  .bar input::placeholder { color: #7d879c; }
+  .send { width: 38px; height: 38px; border-radius: 50%; border: 0; background: #eef3ff; color: #000; font-size: 18px; }
+  .credit { position: fixed; right: 12px; bottom: 8px; font-size: 10px; color: #4d5568; z-index: 3; }
+  .fps { position: fixed; left: 12px; bottom: 8px; font-size: 11px; color: #4d5568; z-index: 3; }
+  .send.stop { background: #ff3df2; color: #000; box-shadow: 0 0 12px #ff3df2; }
+  .info-btn { width: 22px; height: 22px; border-radius: 50%; border: 1px solid var(--line); background: none; color: var(--dim);
+    font: 12px/20px inherit; cursor: pointer; margin-left: 10px; }
+  #info { position: fixed; top: 60px; right: 16px; width: min(360px, calc(100% - 32px)); z-index: 4; display: none;
+    padding: 14px 16px; border-radius: 14px; background: rgba(12,14,20,0.92); border: 1px solid var(--line); font-size: 13px; line-height: 1.5; }
+  #info.open { display: block; }
+  #info .row { display: flex; gap: 8px; align-items: baseline; }
+  #info .sw { flex: none; width: 10px; height: 10px; border-radius: 50%; transform: translateY(1px); }
+  #info .row.off { opacity: 0.55; }
+  #info p { color: var(--dim); margin: 10px 0 0; }
+  .ava.err { color: #ff8fa3; }
+  .meta { font-size: 11px; color: #5d6780; margin-top: 4px; }
+  .welcome { align-self: center; margin-top: 18vh; max-width: 420px; text-align: center; color: #c5cde0; font-size: 17px;
+    padding: 14px 20px; border-radius: 14px; background: rgba(0,0,0,0.45); backdrop-filter: blur(6px); text-shadow: 0 0 10px #000; }
+  /* saved chats, on the left */
+  #side { position: fixed; top: 56px; bottom: 0; left: 0; width: 260px; z-index: 4; display: none; flex-direction: column;
+    padding: 10px; gap: 6px; background: rgba(8,10,14,0.80); border-right: 1px solid var(--line); backdrop-filter: blur(12px); }
+  body.has-chats #side { display: flex; }
+  #newChat { padding: 9px 12px; border-radius: 10px; border: 1px solid var(--line); background: rgba(255,255,255,0.04);
+    color: var(--text); font: inherit; font-size: 14px; text-align: left; cursor: pointer; }
+  #newChat:hover { background: rgba(255,255,255,0.09); }
+  #list { overflow-y: auto; display: flex; flex-direction: column; gap: 2px; scrollbar-width: thin; scrollbar-color: #ffffff22 transparent; }
+  .item { display: flex; align-items: center; gap: 6px; padding: 7px 10px; border-radius: 8px; cursor: pointer; font-size: 14px; color: #c5cde0; }
+  .item:hover, .item.on { background: rgba(255,255,255,0.08); }
+  .item .t { flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .item .x { visibility: hidden; border: 0; background: none; color: var(--dim); cursor: pointer; font-size: 15px; padding: 0 2px; }
+  .item:hover .x { visibility: visible; }
+  .side-btn { display: none; border: 0; background: none; color: var(--text); font-size: 18px; cursor: pointer; margin-right: 12px; }
+  body.has-chats .side-btn { display: inline-block; }
+  @media (min-width: 900px) {
+    body.has-chats:not(.side-closed) #chat { left: 260px; }
+    body.has-chats:not(.side-closed) .bar { left: calc(50% + 130px); width: min(760px, calc(100% - 292px)); }
+  }
+  body.side-closed #side { display: none; }
+  @media (max-width: 899px) { body.has-chats:not(.side-open) #side { display: none; } }
+</style>
+</head>
+<body class="side-closed-auto">
+<canvas id="gl"></canvas>
+<div id="side"><button id="newChat">＋ New chat</button><div id="list"></div></div>
+<div class="top">
+  <div class="name"><button class="side-btn" id="sideBtn" title="Chats">☰</button><span id="title">Ava</span></div>
+  <div class="state"><span class="dot" id="dot"></span><span id="state">connecting</span></div>
+  <div class="where"><button class="info-btn" id="infoBtn" title="What lights up">?</button></div>
+</div>
+<div id="info"></div>
+<div id="chat"><div class="col" id="col"></div></div>
+<div class="bar"><input id="msg" placeholder="Talk to Ava…" autocomplete="off" autofocus><button class="send" id="send" title="Send">↑</button></div>
+<div class="fps" id="fps"></div>
+<script src="brain_mesh.js"></script>
+<script>
+"use strict";
+const Q = new URLSearchParams(location.search);
+const STILL = Q.has("still");
+const B = window.BRAIN;
+// v51: four more areas, cut from the mesh below: the midbrain (her DA), the thalamus and the basal ganglia (from the
+// deep internal capsule between them), and "knowing" (the front of the superior and middle frontal gyri)
+const GROUPS = B.groups.concat(["midbrain", "thalamus", "basal", "knowing"]);
+const G = Object.fromEntries(GROUPS.map((g, i) => [g, i]));
+
+// ---------- colours of the parts she uses (index = group) ----------
+const COL = {
+  cortex: [0, 0, 0], understand: [0.13, 0.9, 1.0], understand_r: [0.13, 0.9, 1.0], reading: [0.24, 1.0, 0.78],
+  meaning: [0.61, 0.48, 1.0], speak: [1.0, 0.24, 0.95], speak_r: [1.0, 0.24, 0.95], workmem: [1.0, 0.69, 0.13],
+  plan: [1.0, 0.88, 0.4], attention: [0.3, 0.55, 1.0], memory: [0.22, 1.0, 0.53], effort: [1.0, 0.48, 0.18],
+  mood: [1.0, 0.31, 0.48], vision: [0.49, 0.42, 1.0], motor: [0.71, 1.0, 0.23], cerebellum: [0.95, 0.6, 1.0],
+  brainstem: [0.85, 0.92, 1.0], inner: [0.6, 0.7, 1.0], ventricles: [0.5, 0.7, 1.0],
+  midbrain: [1.0, 0.95, 0.3], thalamus: [0.55, 1.0, 0.95], basal: [1.0, 0.62, 0.3], knowing: [0.85, 0.75, 1.0],
+};
+const colArr = new Float32Array(GROUPS.length * 3);
+GROUPS.forEach((g, i) => colArr.set(COL[g], i * 3));
+
+// ---------- GL setup ----------
+const cv = document.getElementById("gl");
+const gl = cv.getContext("webgl2", { antialias: true, preserveDrawingBuffer: true });
+function bytes(s) { const b = atob(s), u = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u; }
+function sh(type, src) { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(s); return s; }
+function prog(vs, fs) { const p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p); if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw gl.getProgramInfoLog(p); return p; }
+
+const NG = GROUPS.length;
+const brainVS = `#version 300 es
+in vec3 aPos; in vec3 aNrm; in float aGrp; in float aDepth; in float aBend;
+uniform mat4 uP, uMV; uniform float uAct[${NG}]; uniform vec3 uCol[${NG}];
+out vec3 vN; out vec3 vV; out vec3 vGlow; out float vDepth; out float vBend; out vec3 vObj; flat out int vG;
+void main() {
+  vec4 p = uMV * vec4(aPos, 1.0);
+  vV = -p.xyz; vN = mat3(uMV) * aNrm;
+  int g = int(aGrp + 0.5); vG = g; vGlow = uCol[g] * uAct[g];
+  vDepth = aDepth; vBend = aBend; vObj = aPos;
+  gl_Position = uP * p;
+}`;
+const brainFS = `#version 300 es
+precision highp float;
+in vec3 vN; in vec3 vV; in vec3 vGlow; in float vDepth; in float vBend; in vec3 vObj; flat in int vG;
+uniform float uTime; uniform int uPass; out vec4 o;
+float hash(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+float noise(vec3 x) { vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(mix(hash(i), hash(i + vec3(1,0,0)), f.x), mix(hash(i + vec3(0,1,0)), hash(i + vec3(1,1,0)), f.x), f.y),
+             mix(mix(hash(i + vec3(0,0,1)), hash(i + vec3(1,0,1)), f.x), mix(hash(i + vec3(0,1,1)), hash(i + vec3(1,1,1)), f.x), f.y), f.z); }
+void main() {
+  vec3 n = normalize(vN), v = normalize(vV);
+  if (dot(n, v) < 0.0) n = -n;
+  float fres = pow(1.0 - clamp(dot(n, v), 0.0, 1.0), 2.4);
+  float crown = pow(1.0 - vDepth, 2.2);          // 1 on the outside, 0 deep in a fold
+  float valley = clamp(vBend, 0.0, 1.0);
+  float lam = max(dot(n, normalize(vec3(-0.45, 0.75, 0.55))), 0.0);
+  float spark = pow(noise(vObj * 34.0 + vec3(0.0, uTime * 1.6, uTime * 0.8)), 5.0) * 3.5;
+  float scan = 0.94 + 0.06 * sin(gl_FragCoord.y * 1.4 + uTime * 2.5);
+  vec3 base = vec3(0.80, 0.88, 1.0);
+  vec3 c;
+  if (uPass == 0) {
+    // dark glass: the walls of every fold catch the rim light, the crowns facing her stay dim
+    float s = 0.012 + 0.08 * lam * crown + 0.42 * fres * (0.35 + 0.65 * crown);
+    s *= 1.0 - 0.7 * valley;
+    c = base * s * scan;
+    c += vGlow * (0.10 + 0.55 * fres) * (0.25 + 0.75 * crown) * (0.6 + 0.7 * spark);
+  } else {
+    float w = 0.012;
+    if (vG == ${G.memory} || vG == ${G.brainstem} || vG == ${G.inner} || vG == ${G.effort} || vG == ${G.mood} || vG == ${G.cerebellum} ||
+        vG == ${G.midbrain} || vG == ${G.thalamus} || vG == ${G.basal}) w = 0.05;
+    if (vG == ${G.ventricles}) w = 0.03;
+    c = base * w * fres * scan + vGlow * (0.06 + 0.16 * fres) * (0.7 + 0.5 * spark);
+  }
+  o = vec4(c, 1.0);
+}`;
+const quadVS = `#version 300 es
+out vec2 uv; void main() { vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2); uv = p; gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }`;
+const brightFS = `#version 300 es
+precision highp float; in vec2 uv; uniform sampler2D t; out vec4 o;
+void main() { vec3 c = texture(t, uv).rgb; float l = max(c.r, max(c.g, c.b)); o = vec4(c * smoothstep(0.22, 0.8, l), 1.0); }`;
+const blurFS = `#version 300 es
+precision highp float; in vec2 uv; uniform sampler2D t; uniform vec2 d; out vec4 o;
+void main() { vec3 c = texture(t, uv).rgb * 0.227;
+  c += (texture(t, uv + d * 1.385).rgb + texture(t, uv - d * 1.385).rgb) * 0.316;
+  c += (texture(t, uv + d * 3.231).rgb + texture(t, uv - d * 3.231).rgb) * 0.070; o = vec4(c, 1.0); }`;
+const compFS = `#version 300 es
+precision highp float; in vec2 uv; uniform sampler2D s, b; out vec4 o;
+void main() { vec3 c = texture(s, uv).rgb + texture(b, uv).rgb * 0.9;
+  c = 1.0 - exp(-c * 1.1);
+  float vig = smoothstep(1.25, 0.35, length((uv - 0.5) * vec2(1.6, 1.0)));
+  o = vec4(c * vig, 1.0); }`;
+
+const PB = prog(brainVS, brainFS), PBr = prog(quadVS, brightFS), PBl = prog(quadVS, blurFS), PC = prog(quadVS, compFS);
+
+// mesh buffers
+const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+function attr(name, data, size, type, normalized) {
+  const loc = gl.getAttribLocation(PB, name); if (loc < 0) return;
+  const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, size, type, normalized, 0, 0);
+}
+const partOf = bytes(B.part), grp = new Uint8Array(B.nv);
+for (let i = 0; i < B.nv; i++) grp[i] = B.partGroup[partOf[i]];
+// v51: the new areas' vertices, by mesh part and position (positions read as the GPU reads them). The mesh has no
+// thalamus or basal ganglia of their own: they are cut from the deep internal capsule that lies between them (its
+// medial back half, with the habenula, for the thalamus; the rest for the basal ganglia). Parts: 5 the habenula;
+// 12, 13 the internal capsules; 15, 41 the hippocampi; 20, 45 the midbrain; 29, 30 the middle and 51, 52 the superior
+// frontal gyri; 33, 34 the occipital lobes.
+{
+  const P = new Int16Array(bytes(B.pos).buffer), nv = B.nv;
+  const meanOf = ps => { const m = [0, 0, 0]; let c = 0;
+    for (let i = 0; i < nv; i++) if (ps.includes(partOf[i])) { m[0] += P[3 * i]; m[1] += P[3 * i + 1]; m[2] += P[3 * i + 2]; c++; }
+    return m.map(x => x / Math.max(c, 1)); };
+  const hl = meanOf([15]), hr = meanOf([41]);                         // the left-right axis: from hippocampus to hippocampus
+  const lat = [0, 1, 2].reduce((a, k) => Math.abs(hl[k] - hr[k]) > Math.abs(hl[a] - hr[a]) ? k : a, 0);
+  const mid = meanOf([20, 45])[lat];                                  // the midline, at the midbrain
+  const fr = meanOf([29, 30, 51, 52]), oc = meanOf([33, 34]);
+  const ax = fr.map((x, k) => k === lat ? 0 : x - oc[k]), al = Math.hypot(...ax) || 1;   // back to front
+  const quant = (v, q) => { const s = Float32Array.from(v).sort(); return s[Math.min(s.length - 1, Math.floor(q * s.length))]; };
+  const caps = [], front = [];
+  for (let i = 0; i < nv; i++) {
+    const p = partOf[i];
+    if (p === 20 || p === 45) grp[i] = G.midbrain;
+    else if (p === 5) grp[i] = G.thalamus;
+    else if (p === 12 || p === 13) caps.push(i);
+    else if (p === 29 || p === 30 || p === 51 || p === 52) front.push(i);
+  }
+  const side = i => Math.abs(P[3 * i + lat] - mid), fwd = i => (P[3 * i] * ax[0] + P[3 * i + 1] * ax[1] + P[3 * i + 2] * ax[2]) / al;
+  if (caps.length) {
+    const qs = quant(caps.map(side), 0.5), qf = quant(caps.map(fwd), 0.5);
+    for (const i of caps) grp[i] = side(i) <= qs && fwd(i) <= qf ? G.thalamus : G.basal;
+  }
+  if (front.length) { const q = quant(front.map(fwd), 0.65); for (const i of front) if (fwd(i) >= q) grp[i] = G.knowing; }
+}
+attr("aPos", bytes(B.pos), 3, gl.SHORT, true);
+attr("aNrm", bytes(B.nrm), 3, gl.BYTE, true);
+attr("aGrp", grp, 1, gl.UNSIGNED_BYTE, false);
+attr("aDepth", bytes(B.depth), 1, gl.UNSIGNED_BYTE, true);
+attr("aBend", bytes(B.bend), 1, gl.BYTE, true);
+const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, bytes(B.idx), gl.STATIC_DRAW);
+gl.bindVertexArray(null);
+const quad = gl.createVertexArray();
+
+// render targets: the scene (with depth), and two small ones for the glow
+function target(w, h, depth) {
+  const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR], [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D, k, v);
+  const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  if (depth) { const rb = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, rb);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, w, h); gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, rb); }
+  return { tex, fb, w, h };
+}
+let W = 0, H = 0, T = {};
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = Math.round(innerWidth * dpr); H = Math.round(innerHeight * dpr); cv.width = W; cv.height = H;
+  T = { scene: target(W, H, true), a: target(W >> 2, H >> 2), b: target(W >> 2, H >> 2) };
+}
+resize(); addEventListener("resize", resize);
+
+// ---------- maths ----------
+function persp(fov, asp, n, f) { const t = 1 / Math.tan(fov / 2);
+  return new Float32Array([t / asp, 0, 0, 0, 0, t, 0, 0, 0, 0, (f + n) / (n - f), -1, 0, 0, 2 * f * n / (n - f), 0]); }
+// model-view: turn about y (yaw), tilt about x (pitch), then push back
+function modelView(yaw, pitch, dist) {
+  const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+  // R = Rx(pitch) * Ry(yaw), column-major
+  return new Float32Array([cy, sp * sy, -cp * sy, 0, 0, cp, sp, 0, sy, -sp * cy, cp * cy, 0, 0, -0.02, -dist, 1]);
+}
+
+
+// ---------- her real activity, from the live stream (ava_live /events) ----------
+// Every token she reads or says arrives as one event, the moment it is computed. Each brain area below is driven
+// by one real signal from that event; brightness is relative to her own running average of that signal.
+const level = new Float32Array(NG);   // set by events, fades by itself
+const act = new Float32Array(NG);     // what is drawn
+const avg = {};
+function rel(key, v) {
+  avg[key] = avg[key] === undefined ? v : avg[key] * 0.95 + v * 0.05;
+  return Math.min(1.2, 0.45 * v / Math.max(avg[key], 1e-6));
+}
+function bump(g, v) { const i = G[g]; if (i !== undefined && v > level[i]) level[i] = v; }
+const mean = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
+const sum = a => a ? a.reduce((x, y) => x + y, 0) : 0;
+let beat = 0;
+// v51: the parts she has (the hello's model.parts). Areas of parts she lacks stay dark. An event that carries a part's
+// signal (a mood signal, SM, G, a dopamine signal) counts as having it.
+let has = {};
+function setParts(p) { has = p ? { thalamus: !!p.thalamus, cerebellum: !!p.cerebellum, midbrain: !!p.nucleus, memory: !!(p.memory || p.engram) } : {}; }
+const DARK_UNLESS = ["thalamus", "basal", "knowing", "midbrain", "cerebellum", "mood"];
+function own(a) { if (!has[a]) { has[a] = true; renderLegend(); } }
+
+function onTok(ev) {
+  const L = ev.L || [], n = L.length;
+  const r = L.map((l, i) => rel("s" + i, l.s.length));             // spikes per block
+  const third = k => mean(r.filter((_, i) => Math.floor(i * 3 / Math.max(n, 1)) === k));
+  const early = third(0), mid = third(1), late = third(2);
+  const top = ev.p && ev.p.length ? ev.p[0][1] : 1;                  // her surest guess for the next token
+  const memW = rel("mw", sum(L.map(l => sum(l.mw))));                // what she stored in her fast memory
+  const memR = rel("mr", sum(L.map(l => sum(l.mr))));                // what she recalled from it
+  const io = ev.io || {};
+  // her input side, on every word that comes in (yours while she reads, her own as she says it):
+  if (io.in !== undefined) bump("vision", rel("in", io.in));        // the size of the word's input (embedding + glance + size code)
+  if (n) bump("reading", rel("r0", L[0].s.length));                  // her first block's spikes on that word
+  // v51: her brain parts, each from its own signal only, and only when she has the part (else its area stays dark)
+  const pt = ev.parts || {};
+  if (pt.th && pt.th.length) bump("thalamus", rel("th", mean(pt.th.map(g => Math.abs(g[0] - 1) + Math.abs(g[1] - 1)))));
+  if (pt.cb !== undefined) bump("cerebellum", rel("cb", pt.cb));
+  // v52 live learning: the size of each learning step (tiny numbers, so in millionths): e-prop's change of her last two
+  // blocks (the planning area, where her last third of blocks light), her cerebellum table's change
+  const lr = ev.learn || {};
+  if (lr.e2 !== undefined && lr.e2 !== null) bump("plan", rel("le2", 1e6 * lr.e2));
+  if (lr.cb !== undefined && lr.cb !== null) { own("cerebellum"); bump("cerebellum", rel("lcb", 1e6 * lr.cb)); }
+  const da = pt.da !== undefined ? pt.da : (pt.nm ? pt.nm[2] : undefined);   // a dopamine signal, else v50's nucleus's DA
+  if (da !== undefined) { own("midbrain"); bump("midbrain", rel("da", da)); }
+  if (pt.mood !== undefined) { own("mood"); bump("mood", rel("mood", pt.mood)); }
+  if (pt.sm !== undefined) { own("knowing"); bump("knowing", rel("sm", pt.sm)); }
+  if (pt.g !== undefined) { own("basal"); bump("basal", rel("g", pt.g)); }
+  if (ev.phase === "read") {
+    bump("understand", early); bump("understand_r", 0.5 * early);
+    bump("meaning", mid); bump("plan", 0.7 * late);
+    bump("effort", 0.5 * (1 - top));
+  } else {
+    // her output side, only on words she says: how sure she was of the word, and her last block's units
+    if (io.conf !== undefined) { const c = rel("conf", io.conf); bump("speak", c); bump("speak_r", 0.45 * c); }
+    if (n && L[n - 1].h !== undefined) bump("motor", rel("hL", L[n - 1].h));
+    bump("understand", 0.3 * early); bump("meaning", mid); bump("plan", late);
+    bump("effort", 1 - top);
+  }
+  bump("memory", Math.max(memW, memR));                              // her fast memory (hippocampus): stored and recalled
+  bump("workmem", memR);
+  if (ev.e) { bump("memory", rel("e", ev.e.rms)); bump("attention", ev.e.top.length ? 1.2 * ev.e.top[0][1] : 0); }
+  else bump("attention", 0.6 * late);
+  beat = 1;                                                           // one beat per token computed
+}
+
+// ---------- chat ----------
+const colEl = document.getElementById("col"), chatEl = document.getElementById("chat");
+const stateEl = document.getElementById("state"), fpsEl = document.getElementById("fps"), titleEl = document.getElementById("title");
+const msgEl = document.getElementById("msg"), sendEl = document.getElementById("send");
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+// an empty chat says hello (gone with the first message)
+function welcome() { if (!colEl.children.length) colEl.innerHTML = `<div class="welcome">Hi, I'm ${esc(titleEl.textContent.split(" ")[0] || "Ava")}. Ask me a question, and watch my brain light up as I think.</div>`; }
+function bubble(cls, html) { const w = colEl.querySelector(".welcome"); if (w) w.remove();
+  const d = document.createElement("div"); d.className = "msg " + cls; d.innerHTML = html; colEl.appendChild(d);
+  chatEl.scrollTop = chatEl.scrollHeight; return d; }
+let busy = false, avaEl = null, state = "connecting", looked = [];
+function setBusy(b) { busy = b; sendEl.textContent = b ? "■" : "↑"; sendEl.classList.toggle("stop", b); sendEl.title = b ? "Stop" : "Send"; }
+function setState(s) { state = s; stateEl.textContent = s; }
+
+function onEvent(ev) {
+  switch (ev.type) {
+    case "hello":
+      // her name only (from name.txt beside her brain, or --name): no paths or settings on the page
+      titleEl.textContent = (ev.model && ev.model.title) || "Ava"; document.title = titleEl.textContent;
+      setParts(ev.model && ev.model.parts); renderLegend();
+      if (ev.swapped) bump("memory", 1.2);   // v51: a brain from her sleep (the learner's consolidation) goes live
+      if (colEl.querySelector(".welcome")) { colEl.innerHTML = ""; welcome(); }
+      setBusy(!!ev.busy); setState(ev.busy ? "thinking" : "resting"); break;
+    case "turn":
+      // a turn in another chat (or another tab) still lights her brain, but its words stay in that chat
+      avaEl = null;
+      if (!ev.chat || ev.chat === chatId) {
+        if (ev.mode === "talk") bubble("user", esc(ev.text));
+        avaEl = bubble("ava", '<div class="who">AVA</div><span class="caret"></span>');
+      }
+      setBusy(true); setState("reading"); break;
+    case "saved": loadList(); break;
+    case "lookup":
+      // her library cued these passages: her memory (hippocampus) fetching, before she reads
+      looked = (!ev.chat || ev.chat === chatId) ? (ev.titles || []).filter((t, i, a) => a.indexOf(t) === i) : [];
+      if ((ev.titles || []).length) { bump("memory", 1.2); bump("attention", 0.8); }
+      break;
+    case "tok":
+      onTok(ev);
+      if (ev.phase === "say") {
+        setState("speaking");
+        if (avaEl && ev.reply !== undefined) {
+          avaEl.innerHTML = `<div class="who">AVA</div>${esc(ev.reply.trimStart())}<span class="caret"></span>`;
+          chatEl.scrollTop = chatEl.scrollHeight;
+        }
+      } else if (state !== "reading") setState("reading");
+      break;
+    case "done":
+      if (avaEl) {
+        const said = (ev.reply || "").trim();
+        avaEl.innerHTML = `<div class="who">AVA</div>${said ? esc(said) : "<i>(no answer)</i>"}` +
+          (looked.length ? `<div class="meta">looked up: ${looked.map(esc).join(" · ")}</div>` : "") +
+          (ev.reason === "stopped" ? '<div class="meta">stopped</div>' : "");
+        avaEl = null;
+      }
+      looked = [];
+      if (ev.ms_per_token) fpsEl.textContent = `${(1000 / ev.ms_per_token).toFixed(0)} tokens/s`;
+      break;
+    case "idle": setBusy(false); setState("resting"); break;
+    case "error": bubble("ava err", `<div class="who">AVA</div>${esc(ev.message)}`); break;
+  }
+}
+const es = new EventSource("events");
+es.onmessage = m => { try { onEvent(JSON.parse(m.data)); } catch (e) { console.error(e); } };
+es.onerror = () => setState("offline: is the Ava window still open?");
+
+async function send() {
+  if (busy) { fetch("stop", { method: "POST" }); return; }
+  const text = msgEl.value.trim();
+  if (!text) return;
+  msgEl.value = "";
+  const r = await fetch("say", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: "talk", text, chat: chatId }) });
+  if (r.status === 409) bubble("ava err", '<div class="who">AVA</div>Still answering. Wait a moment.');
+  else if (!r.ok) bubble("ava err", `<div class="who">AVA</div>${esc(await r.text())}`);
+}
+sendEl.onclick = send;
+msgEl.addEventListener("keydown", e => { if (e.key === "Enter") send(); });
+
+// ---------- saved chats (the sidebar; shown when ava_live runs with --chats) ----------
+const listEl = document.getElementById("list");
+function newId() { return "c-" + new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14) + "-" + Math.random().toString(36).slice(2, 6); }
+let chatId = newId();
+async function loadList() {
+  let list;
+  try { const r = await fetch("chats"); if (!r.ok) return; list = await r.json(); } catch (e) { return; }
+  document.body.classList.add("has-chats");
+  listEl.innerHTML = "";
+  for (const c of list) {
+    const d = document.createElement("div");
+    d.className = "item" + (c.id === chatId ? " on" : "");
+    d.innerHTML = `<span class="t">${esc(c.title || "(untitled)")}</span><button class="x" title="Delete chat">×</button>`;
+    d.onclick = () => openChat(c.id);
+    d.querySelector(".x").onclick = async e => {
+      e.stopPropagation();
+      if (!confirm(`Delete the chat "${c.title}"?`)) return;
+      await fetch(`chats/${c.id}/delete`, { method: "POST" });
+      if (c.id === chatId) newChat(); else loadList();
+    };
+    listEl.appendChild(d);
+  }
+}
+async function openChat(id) {
+  const r = await fetch(`chats/${id}`);
+  if (!r.ok) return;
+  const c = await r.json();
+  chatId = id; avaEl = null; colEl.innerHTML = "";
+  for (const t of c.turns || []) {
+    bubble("user", esc(t.user));
+    bubble("ava", `<div class="who">AVA</div>${t.ava.trim() ? esc(t.ava.trim()) : "<i>(no answer)</i>"}`);
+  }
+  if (!(c.turns || []).length) welcome();
+  document.body.classList.remove("side-open");
+  loadList();
+}
+function newChat() { chatId = newId(); avaEl = null; colEl.innerHTML = ""; welcome(); loadList(); msgEl.focus(); }
+document.getElementById("newChat").onclick = newChat;
+document.getElementById("sideBtn").onclick = () => {
+  if (innerWidth < 900) document.body.classList.toggle("side-open"); else document.body.classList.toggle("side-closed");
+};
+loadList();
+welcome();
+
+// ---------- what lights up (shown with ?) ----------
+const LEGEND = [
+  ["understand", "Understanding", "spikes in her first third of blocks"],
+  ["meaning", "Meaning", "spikes in her middle blocks"],
+  ["plan", "Planning", "spikes in her last blocks (with live learning on, also how much her last two blocks change as she learns from each word)"],
+  ["memory", "Memory (hippocampus)", "her fast memory (what she stores and recalls), her engram's look back at earlier words, each library lookup, and each brain her sleep makes going live"],
+  ["workmem", "Working memory", "what she recalls from her fast memory"],
+  ["attention", "Attention", "how sharply she focuses on one earlier word"],
+  ["vision", "Seeing", "the size of each word's input as it enters her (its learned code, plus her glance at digits and her sense of a number's size)"],
+  ["reading", "Reading", "the spikes of her first block as each word comes in: yours, and her own as she says it"],
+  ["speak", "Speaking", "how sure she was of each word she says (both sides)"],
+  ["motor", "Motor", "the activity of her last block as she puts each word out"],
+  ["cerebellum", "Cerebellum", "her cerebellum part (CB): the size of the correction it adds to her next-word guess (with live learning on, it also learns from each word, and lights with the size of each change)"],
+  ["thalamus", "Thalamus", "her relay part (TH): how far its gates turn each block's flow and memory read up or down from neutral"],
+  ["midbrain", "Midbrain", "her dopamine signal (DA, from her neuromodulator nucleus)"],
+  ["basal", "Basal ganglia", "her choosing part (G): how strongly it prefers the answer it picks over the others and over \"I don't know\""],
+  ["knowing", "Knowing (front of the frontal lobe)", "her self-model (SM): how sure she is that her answer is right"],
+  ["mood", "Emotion area", "a mood signal"],
+  ["effort", "Effort", "how unsure she is about the next word"],
+  ["brainstem", "Brainstem", "one beat per word she computes"],
+];
+const rgb = c => `rgb(${c.map(x => Math.round(255 * Math.min(1, x))).join(",")})`;
+// v51: an area whose part this brain lacks says so, and stays dark
+function renderLegend() {
+  document.getElementById("info").innerHTML = LEGEND.map(([g, name, what]) => {
+    const off = (DARK_UNLESS.includes(g) && !has[g]) || (g === "memory" && has.memory === false);
+    return `<div class="row${off ? " off" : ""}"><span class="sw" style="background:${rgb(COL[g])};box-shadow:0 0 8px ${rgb(COL[g])}"></span>` +
+      `<span><b>${name}</b>: ${what}${off ? " <i>(not in this brain: dark)</i>" : ""}</span></div>`; }).join("") +
+    "<p>Brightness is relative to her own usual level. The areas are an analogy: her parts do jobs like these regions do, " +
+    "they are not copies of them. An area lights only from its own part's real signal; a part she does not have stays dark. " +
+    "She has no feelings, so the emotion area stays dark unless her brain sends a mood signal.</p>" +
+    "<p>Brain model: BodyParts3D © DBCLS, CC BY 4.0.</p>";
+}
+renderLegend();
+document.getElementById("infoBtn").onclick = () => document.getElementById("info").classList.toggle("open");
+
+// ---------- frame ----------
+const uP = gl.getUniformLocation(PB, "uP"), uMV = gl.getUniformLocation(PB, "uMV"), uAct = gl.getUniformLocation(PB, "uAct"),
+      uCol = gl.getUniformLocation(PB, "uCol"), uTime = gl.getUniformLocation(PB, "uTime"), uPass = gl.getUniformLocation(PB, "uPass");
+let t0 = performance.now(), last = t0;
+function frame(now) {
+  const T0 = (now - t0) / 1000, dt = Math.min(0.1, (now - last) / 1000); last = now;
+  const fade = Math.exp(-dt / 0.7), ease = Math.min(1, dt * 14);
+  beat *= Math.exp(-dt / 0.12);
+  for (let g = 0; g < NG; g++) {
+    level[g] *= fade;
+    const rest = 0.015 + 0.10 * Math.pow(Math.max(0, Math.sin(T0 * (0.7 + g * 0.11) + g * 2.3)), 10);
+    act[g] += (Math.min(1.2, rest + level[g]) - act[g]) * ease;
+  }
+  if (!busy) { const ph = (T0 * 1.1) % 1; beat = Math.max(beat, 0.25 * (Math.exp(-(((ph - 0.05) / 0.03) ** 2)) + 0.6 * Math.exp(-(((ph - 0.2) / 0.03) ** 2)))); }
+  act[G.brainstem] = 0.15 + 0.6 * beat;
+  for (const a of DARK_UNLESS) if (!has[a]) act[G[a]] = Math.min(act[G[a]], 0.12);
+  if (has.memory === false) act[G.memory] = Math.min(act[G.memory], 0.12);
+  const yaw = 0.30 + 0.20 * Math.sin(T0 * 0.13), pitch = 0.20 + 0.04 * Math.sin(T0 * 0.09);
+  const P = persp(28 * Math.PI / 180, W / H, 0.5, 20), MV = modelView(yaw, pitch, 4.4);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, T.scene.fb); gl.viewport(0, 0, W, H);
+  gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.useProgram(PB); gl.bindVertexArray(vao);
+  gl.uniformMatrix4fv(uP, false, P); gl.uniformMatrix4fv(uMV, false, MV);
+  gl.uniform1fv(uAct, act); gl.uniform3fv(uCol, colArr); gl.uniform1f(uTime, T0);
+  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS); gl.depthMask(true); gl.colorMask(false, false, false, false); gl.disable(gl.BLEND);
+  gl.drawElements(gl.TRIANGLES, B.ni, gl.UNSIGNED_INT, 0);
+  gl.colorMask(true, true, true, true); gl.depthFunc(gl.LEQUAL); gl.depthMask(false); gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  gl.uniform1i(uPass, 0); gl.drawElements(gl.TRIANGLES, B.ni, gl.UNSIGNED_INT, 0);
+  gl.disable(gl.DEPTH_TEST); gl.uniform1i(uPass, 1); gl.drawElements(gl.TRIANGLES, B.ni, gl.UNSIGNED_INT, 0);
+  gl.disable(gl.BLEND); gl.bindVertexArray(quad);
+  const pass = (p, dst, src, setup) => { gl.bindFramebuffer(gl.FRAMEBUFFER, dst ? dst.fb : null); gl.viewport(0, 0, dst ? dst.w : W, dst ? dst.h : H);
+    gl.useProgram(p); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, src.tex); gl.uniform1i(gl.getUniformLocation(p, p === PC ? "s" : "t"), 0);
+    if (setup) setup(); gl.drawArrays(gl.TRIANGLES, 0, 3); };
+  pass(PBr, T.a, T.scene);
+  for (let k = 0; k < 2; k++) {
+    pass(PBl, T.b, T.a, () => gl.uniform2f(gl.getUniformLocation(PBl, "d"), 1 / T.a.w, 0));
+    pass(PBl, T.a, T.b, () => gl.uniform2f(gl.getUniformLocation(PBl, "d"), 0, 1 / T.a.h));
+  }
+  pass(PC, null, T.scene, () => { gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, T.a.tex); gl.uniform1i(gl.getUniformLocation(PC, "b"), 1); });
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

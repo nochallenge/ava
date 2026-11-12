@@ -1,7 +1,7 @@
 // TESTING / DESIGN ONLY — blimp_gpu: BLiMP minimal pairs for a train_gpu checkpoint (model.safetensors).
 //
 // blimp_gpu --model FILE --arch S|F|G|T --d D --layers L [--ctx 256] [--dir data/blimp] [--batch 256]
-//           [--limit N per phenomenon] [--cpu] [--bpe FILE] [--glance]
+//           [--limit N per phenomenon] [--cpu] [--bpe FILE] [--glance] [--fused]
 //
 // v39 --glance: a model D trained with the glance (vocab 4112); every sentence gets its length marks
 // (ava_data::numbers::insert_marks) before scoring, as her training text had them.
@@ -12,6 +12,9 @@
 // normalisation). Chance is 50%. Sentences are scored in batches sorted by length and right-padded with
 // PAD; every model here is causal, so padding after a sentence cannot change its scores, and PAD
 // targets are not scored.
+//
+// v52 --fused: every score from the fused forward (eval::score_logits; runs/v52/fasteval.md); a model it does not take
+// (or the CPU) is scored on the reference forward, and the line after loading says why.
 
 use ava_data::bpe::{Bpe, EOS};
 use ava_data::numbers::insert_marks;
@@ -21,7 +24,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 const USAGE: &str = "usage: blimp_gpu --model FILE --arch S|F|G|T --d D --layers L [--ctx 256] [--dir DIR] [--batch 256]\n\
-    \x20                [--limit N] [--cpu] [--bpe FILE] [--glance]";
+    \x20                [--limit N] [--cpu] [--bpe FILE] [--glance] [--fused]";
 
 fn main() {
     if let Err(e) = run() {
@@ -65,6 +68,11 @@ fn run() -> Result<(), String> {
         if key == "-h" || key == "--help" {
             return Err(USAGE.into());
         }
+        if key == "--fused" {
+            ava_gpu::eval::set_fused(true); // v52: the fused forward (eval::score_logits)
+            i += 1;
+            continue;
+        }
         if key == "--cpu" || key == "--glance" {
             if key == "--cpu" {
                 cpu = true;
@@ -97,6 +105,9 @@ fn run() -> Result<(), String> {
     let dev = ava_gpu::device(cpu).map_err(|e| format!("device: {e}"))?;
     let bpe = Bpe::load(&bpe_path).map_err(|e| format!("bpe {}: {e}", bpe_path.display()))?;
     let (_cfg, _varmap, model) = ava_gpu::ckpt::load_expect(&model_path, kind, ctx, d, layers, glance, &dev)?;
+    if ava_gpu::eval::fused() {
+        println!("{}", ava_gpu::eval::fused_line(&model, &dev));
+    }
 
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
         .map_err(|e| format!("blimp dir {}: {e}", dir.display()))?

@@ -65,6 +65,10 @@ pub struct Stream {
     /// the last 17 tokens (the magnitude code reads back to the length mark).
     ekv: Option<(Tensor, Tensor)>,
     hist: Vec<u32>,
+    /// v42 (S1): a one-row carried State (src/state.rs). Some for a model with block options (the only way they
+    /// generate token by token) and for `Model::stream_batched`; then `step` and `feed` go through
+    /// `forward_with_state` and the fields above stay unused. None: today's token-by-token stream, unchanged.
+    pub(crate) st: Option<crate::state::State>,
 }
 
 impl Stream {
@@ -168,6 +172,8 @@ pub struct Config {
     /// a store of every token read so far (keys, values and queries from the block's normed input), its output
     /// projection starting at 0 so the model starts exactly as without it.
     pub engram: Option<usize>,
+    /// v42 (Wave 2B): the block options (src/arch.rs); the default is today's block exactly.
+    pub arch: crate::arch::Arch,
 }
 
 /// v39: the place embedding's rows (units, tens, ... up to 15 digits), and its tensor name.
@@ -183,7 +189,7 @@ impl Config {
     }
 
     pub fn with_kind(kind: Kind, vocab: usize, d: usize, layers: usize, ctx: usize) -> Config {
-        let c = Config { kind, vocab, d, layers, ctx, glance: false, mag: false, engram: None };
+        let c = Config { kind, vocab, d, layers, ctx, glance: false, mag: false, engram: None, arch: crate::arch::Arch::default() };
         c.validate().unwrap_or_else(|e| panic!("bad model config: {e}"));
         c
     }
@@ -198,6 +204,13 @@ impl Config {
     /// v40: this config with the magnitude code on (needs the glance).
     pub fn with_mag(self) -> std::result::Result<Config, String> {
         let c = Config { mag: true, ..self };
+        c.validate()?;
+        Ok(c)
+    }
+
+    /// v42: this config with the block options `arch` (src/arch.rs).
+    pub fn with_arch(self, arch: crate::arch::Arch) -> std::result::Result<Config, String> {
+        let c = Config { arch, ..self };
         c.validate()?;
         Ok(c)
     }
@@ -224,30 +237,52 @@ impl Config {
         if self.glance && (self.kind != Kind::D || self.vocab != ava_data::numbers::VOCAB_GLANCE) {
             return Err(format!("the glance needs model D and vocab {}: {self:?}", ava_data::numbers::VOCAB_GLANCE));
         }
-        if self.kind.is_ava() && (MLP_MULT * self.d) % KWTA_DIV != 0 {
-            return Err(format!("4d = {} must be divisible by {KWTA_DIV} for kWTA", MLP_MULT * self.d));
+        if self.kind.is_ava() && self.hidden() % self.arch.kwta_div != 0 {
+            return Err(format!("the hidden width {} must be divisible by {} for kWTA", self.hidden(), self.arch.kwta_div));
         }
         if self.kind != Kind::S && self.d % HEAD_SIZE != 0 {
             return Err(format!("d = {} must be a multiple of the head size {HEAD_SIZE} for model {}", self.d, self.kind.name()));
         }
+        self.arch.validate(self)?;
         Ok(())
     }
 
+    /// The MLP's hidden width: MLP_MULT·d, or --mlp-mult M·d for a model grown wider (A15, src/grow.rs).
     pub fn hidden(&self) -> usize {
-        MLP_MULT * self.d
+        let m = self.arch.mem.mlp_mult;
+        if m > 0 {
+            m * self.d
+        } else {
+            MLP_MULT * self.d
+        }
     }
 
+    /// The fast-weight memory's heads (d / 32 today; v42 --head-size).
     pub fn heads(&self) -> usize {
-        self.d / HEAD_SIZE
+        self.d / self.arch.head_size
     }
 
     pub fn kwta_k(&self) -> usize {
-        self.hidden() / KWTA_DIV
+        self.hidden() / self.arch.kwta_div
     }
 
     /// Init std of projections that write into the residual stream.
     pub fn resid_std(&self) -> f64 {
+        if self.arch.resid_fix {
+            return INIT_STD / (self.resid_writes() as f64).sqrt();
+        }
         INIT_STD / ((2 * self.layers) as f64).sqrt()
+    }
+
+    /// v42 (R1, --resid-fix): how many writes into the residual stream the model makes per token: 2 per block for S
+    /// and T, 3 for the kinds with a memory or attention beside the spiking memory, plus 1 in the engram block.
+    /// `resid_std` assumed 2 per block for every kind (kept as the default, so past runs reproduce).
+    pub fn resid_writes(&self) -> usize {
+        let per = match self.kind {
+            Kind::S | Kind::T => 2,
+            _ => 3,
+        };
+        per * self.layers + usize::from(self.engram.is_some())
     }
 
     /// A only: whether block `i` has attention (every 4th block counting back from the last) instead of the
@@ -266,7 +301,9 @@ impl Config {
         let (v, d, h) = (self.vocab, self.d, self.hidden());
         let mlp = d + d * h + h * d;
         let spike = d + d * d + d + d * d;
-        let mem_r = d + 5 * d * d + 2 * (d * self.heads() + self.heads());
+        // v44 K2 (--gate sigmoid): Wd [d, R] and Wu [R, d] instead of Wg [d, d]
+        let wg = if self.arch.gate == crate::arch::OutGate::Sigmoid { 2 * d * self.arch.gate_rank } else { d * d };
+        let mem_r = d + 4 * d * d + wg + 2 * (d * self.heads() + self.heads());
         let (layers_total, pos) = match self.kind {
             Kind::S => (self.layers * (spike + mlp), 0),
             Kind::F => (self.layers * (spike + (d + 4 * d * d) + mlp), 0),
@@ -280,91 +317,116 @@ impl Config {
         };
         let place = if self.glance { PLACES * d } else { 0 } + if self.mag { crate::mag::MAG_F * d } else { 0 };
         let engram = if self.engram.is_some() { d + 4 * d * d } else { 0 };
-        let total = v * d + pos + place + layers_total + engram + d;
-        (total, total - v * d - pos - place)
+        let (extra, extra_emb) = crate::arch::extra_weights(self);
+        let total = v * d + pos + place + layers_total + engram + d + extra;
+        (total, total - v * d - pos - place - extra_emb)
     }
 }
 
-struct SpikeMem {
-    norm: Tensor,
-    win: Tensor,
-    beta: Tensor,
-    wout: Tensor,
+pub(crate) struct SpikeMem {
+    pub(crate) norm: Tensor,
+    pub(crate) win: Tensor,
+    pub(crate) beta: Tensor,
+    pub(crate) wout: Tensor,
 }
 
-struct Attn {
-    norm: Tensor,
-    wq: Tensor,
-    wk: Tensor,
-    wv: Tensor,
-    wo: Tensor,
+pub(crate) struct Attn {
+    pub(crate) norm: Tensor,
+    pub(crate) wq: Tensor,
+    pub(crate) wk: Tensor,
+    pub(crate) wv: Tensor,
+    pub(crate) wo: Tensor,
 }
 
-struct Mlp {
-    norm: Tensor,
-    w1: Tensor,
-    w2: Tensor,
+pub(crate) struct Mlp {
+    pub(crate) norm: Tensor,
+    pub(crate) w1: Tensor,
+    pub(crate) w2: Tensor,
 }
 
 /// Hebbian fast weights (F, G): per head a matrix of fast synapses that every token strengthens by the
 /// outer product of its key and value and that fades per token; the query reads it.
-struct Hebb {
-    norm: Tensor,
-    wq: Tensor,
-    wk: Tensor,
-    wv: Tensor,
-    wo: Tensor,
-    gates: Option<Gates>,
+pub(crate) struct Hebb {
+    pub(crate) norm: Tensor,
+    pub(crate) wq: Tensor,
+    pub(crate) wk: Tensor,
+    pub(crate) wv: Tensor,
+    pub(crate) wo: Tensor,
+    pub(crate) gates: Option<Gates>,
     /// R only: the output gate Wg [d, d] (read-out times silu(h·Wg), so the memory can stay quiet)
     /// and unit-length queries and keys (every imprint has the same strength).
-    wg: Option<Tensor>,
-    qk_norm: bool,
+    pub(crate) wg: Option<Tensor>,
+    /// v44 K2 (--gate sigmoid, D only): the low-rank gate (Wd [d, R], Wu [R, d]); the read-out times sigmoid(h·Wd·Wu)
+    pub(crate) wgl: Option<(Tensor, Tensor)>,
+    pub(crate) qk_norm: bool,
     /// D only: the gated delta rule (`delta_rule`): each write first erases what the memory recalls for k.
-    delta: bool,
+    pub(crate) delta: bool,
 }
 
 /// G's neuromodulation, per head and per token, read from the same normalised input h:
 /// forget alpha = sigmoid(h·Wa + ba + logit(gamma_h)), write strength beta = 2·sigmoid(h·Wb + bb) in (0, 2).
 /// Wa, ba, Wb, bb start at 0, so at init alpha = F's gamma_h and beta = 1 for every token:
 /// G starts exactly as F and learns when to forget and when to imprint more or less strongly.
-struct Gates {
-    wa: Tensor,
-    ba: Tensor,
-    wb: Tensor,
-    bb: Tensor,
+pub(crate) struct Gates {
+    pub(crate) wa: Tensor,
+    pub(crate) ba: Tensor,
+    pub(crate) wb: Tensor,
+    pub(crate) bb: Tensor,
     /// logit(gamma_h) [nh], a constant (not trained).
-    off: Tensor,
+    pub(crate) off: Tensor,
 }
 
-struct Block {
-    mem: Option<SpikeMem>,
-    attn: Option<Attn>,
-    hebb: Option<Hebb>,
+pub(crate) struct Block {
+    pub(crate) mem: Option<SpikeMem>,
+    pub(crate) attn: Option<Attn>,
+    pub(crate) hebb: Option<Hebb>,
     /// v40: the engram memory read (Config::engram), after the fast weights.
-    eng: Option<Attn>,
-    mlp: Mlp,
+    pub(crate) eng: Option<Attn>,
+    pub(crate) mlp: Mlp,
 }
 
 pub struct Model {
     pub cfg: Config,
-    tok: Tensor,
-    pos: Option<Tensor>,
+    pub(crate) tok: Tensor,
+    pub(crate) pos: Option<Tensor>,
     /// v39 glance only: the place embedding [PLACES, d].
-    place: Option<Tensor>,
+    pub(crate) place: Option<Tensor>,
     /// v40 only: the magnitude code's weights [MAG_F, d].
-    mag_w: Option<Tensor>,
+    pub(crate) mag_w: Option<Tensor>,
     /// v40 lesion switches (after training, as neuroscience switches an area off): the place code, the magnitude
     /// code and the engram memory read add nothing while on.
-    lesion: std::cell::Cell<(bool, bool, bool)>,
-    blocks: Vec<Block>,
-    final_norm: Tensor,
+    pub(crate) lesion: std::cell::Cell<(bool, bool, bool)>,
+    pub(crate) blocks: Vec<Block>,
+    pub(crate) final_norm: Tensor,
     /// Whether forward computes the logged activity means (off on steps that are not logged: they never
     /// feed the loss, and cost a pass over every hidden layer).
-    track: std::cell::Cell<bool>,
+    pub(crate) track: std::cell::Cell<bool>,
     /// v37: inference only (no backward will follow): D's fast-weight blocks use the training step's fused kernel
     /// (hebb_fwd_raw: a state saved every 16 tokens) instead of the autograd op that keeps one per token.
-    infer: std::cell::Cell<bool>,
+    pub(crate) infer: std::cell::Cell<bool>,
+    /// v42 (Wave 2B): the block options' extra parts (Some exactly when `cfg.arch.needs_path()`).
+    pub(crate) ext: Option<crate::arch::ModelExt>,
+    /// Tests only: run today's model through `forward_arch` (to check it against the old forward).
+    pub(crate) force_arch: std::cell::Cell<bool>,
+    /// v42 Wave 2C (O2): on only inside the training losses (`loss_and_grads_autograd`, `loss_aux`), so --mem-reset
+    /// and --recall-loss act in training and never in scoring or generation.
+    pub(crate) train_fwd: std::cell::Cell<bool>,
+    /// E10 (src/int8.rs): the int8 copies for talking on the CPU (`set_int8`); None (the default): every matmul in f32.
+    pub(crate) q8: std::cell::RefCell<Option<std::sync::Arc<crate::int8::Q8Set>>>,
+    /// The fused one-token CPU step (src/model/fstep.rs, `set_fused`); off by default.
+    pub(crate) fused: std::cell::Cell<bool>,
+    /// v51 fast4 (src/fast4.rs, `set_fast4`): the fused step also with int8 off (f32 products in gemm's one-row
+    /// order), and the online sessions in it; off by default (int8 off then keeps `forward_with_state`).
+    pub(crate) fast4: std::cell::Cell<bool>,
+    /// v49: Some only inside `forward_trace` of a model with block options: what each block's units emitted (filled
+    /// by `forward_arch`'s blocks; read only, never fed back).
+    pub(crate) trace_rec: std::cell::RefCell<Option<TraceRec>>,
 }
+
+// the fused one-token CPU step (`Model::set_fused`)
+pub mod fstep;
+// v47: D with Stage 3's winning block options on a hand-written training step (src/model/fwin.rs)
+pub mod fwin;
 
 /// Per-layer activity of one forward pass (means over every position), as 0-d tensors on the device.
 /// Empty for T.
@@ -385,7 +447,7 @@ impl Activity {
 
 /// x / sqrt(mean(x^2) + eps) · gain over the last dim.
 /// rmsnorm for the training forward: the fused kernel on CUDA (speed round 2), else the primitive chain.
-fn norm(x: &Tensor, gain: &Tensor) -> Result<Tensor> {
+pub(crate) fn norm(x: &Tensor, gain: &Tensor) -> Result<Tensor> {
     if crate::fast_path() && x.device().is_cuda() {
         crate::fused::rms_norm(x, gain, NORM_EPS)
     } else {
@@ -446,6 +508,10 @@ pub fn kwta_mask(u: &Tensor, k: usize) -> Result<Tensor> {
     if k >= u.dim(D::Minus1)? {
         return u.detach().ones_like();
     }
+    if u.dtype() != DType::F32 {
+        // v51 fast1 (F-1's f64 reference on the CPU): the same mask by the sort, in u's dtype
+        return kwta_mask_sorted(u, k)?.to_dtype(u.dtype());
+    }
     crate::lif::kwta_mask_fast(u, k)
 }
 
@@ -470,9 +536,14 @@ pub fn causal_mask(t: usize, dev: &Device) -> Result<Tensor> {
 
 /// Causal multi-head self-attention on h [b·t, d] → [b·t, d] (before the residual add).
 fn attention(h: &Tensor, a: &Attn, b: usize, t: usize, mask: &Tensor) -> Result<Tensor> {
+    attention_g(h, a, b, t, mask, None)
+}
+
+/// `attention` with v45 W4's output gate `gate` [b·t, heads or d] on the heads before Wo (None: `attention`).
+fn attention_g(h: &Tensor, a: &Attn, b: usize, t: usize, mask: &Tensor, gate: Option<&Tensor>) -> Result<Tensor> {
     let d = h.dim(1)?;
     let nh = d / HEAD_SIZE;
-    let heads = |w: &Tensor| -> Result<Tensor> { h.matmul(w)?.reshape((b, t, nh, HEAD_SIZE))?.transpose(1, 2)?.contiguous() };
+    let heads = |w: &Tensor| -> Result<Tensor> { crate::int8::mm(&h, w)?.reshape((b, t, nh, HEAD_SIZE))?.transpose(1, 2)?.contiguous() };
     let (q, k, v) = (heads(&a.wq)?, heads(&a.wk)?, heads(&a.wv)?);
     let scale = 1.0 / (HEAD_SIZE as f64).sqrt();
     // Speed round 4: one fused kernel (no [t, t] score tensor) on CUDA; same maths as the chain below.
@@ -480,10 +551,14 @@ fn attention(h: &Tensor, a: &Attn, b: usize, t: usize, mask: &Tensor) -> Result<
         crate::fused::causal_attention(&q, &k, &v, scale)?
     } else {
         let sc = q.matmul(&k.t()?.contiguous()?)?.affine(scale, 0.0)?;
-        candle_nn::ops::softmax(&sc.broadcast_add(mask)?, D::Minus1)?.matmul(&v)?
+        candle_nn::ops::softmax(&sc.broadcast_add(&mask.to_dtype(sc.dtype())?)?, D::Minus1)?.matmul(&v)?
     };
     let o = o.transpose(1, 2)?.contiguous()?.reshape((b * t, d))?;
-    o.matmul(&a.wo)
+    let o = match gate {
+        Some(g) => crate::arch::eng_gate_apply(&o, g)?,
+        None => o,
+    };
+    crate::int8::mm(&o, &a.wo)
 }
 
 /// Forgetting rates of the fast weights, one per head: gamma_h = 1 - 2^-(5 + h), so the memory's
@@ -506,26 +581,42 @@ pub fn hebb_decay(nh: usize, t: usize, dev: &Device) -> Result<Tensor> {
 }
 
 /// rmsnorm over the last dim without a gain (each head's read-out is normalised on its own).
-fn head_norm(y: &Tensor) -> Result<Tensor> {
+pub(crate) fn head_norm(y: &Tensor) -> Result<Tensor> {
     let inv = (y.sqr()?.mean_keepdim(D::Minus1)? + NORM_EPS)?.powf(-0.5)?;
     y.broadcast_mul(&inv)
 }
 
 /// x / |x| over the last dim.
-fn l2_norm(x: &Tensor) -> Result<Tensor> {
+pub(crate) fn l2_norm(x: &Tensor) -> Result<Tensor> {
     x.broadcast_mul(&(x.sqr()?.sum_keepdim(D::Minus1)? + 1e-6)?.powf(-0.5)?)
 }
 
 /// R: the read-out y [n, d] times silu(h·Wg); F and G: y unchanged.
-fn out_gate(y: &Tensor, h: &Tensor, m: &Hebb) -> Result<Tensor> {
+pub(crate) fn out_gate(y: &Tensor, h: &Tensor, m: &Hebb) -> Result<Tensor> {
     match &m.wg {
-        Some(wg) => y.mul(&candle_nn::ops::silu(&h.matmul(wg)?)?),
-        None => Ok(y.clone()),
+        Some(wg) => y.mul(&candle_nn::ops::silu(&crate::int8::mm(h, wg)?)?),
+        // v44 K2 (--gate sigmoid): times sigmoid(h·Wd·Wu), the small projections in f32
+        None => match &m.wgl {
+            Some((wd, wu)) => y.mul(&sigmoid(&h.matmul(wd)?.matmul(wu)?)?),
+            None => Ok(y.clone()),
+        },
+    }
+}
+
+impl Hebb {
+    /// D's gate columns in the fused projection h·[Wq|Wk|Wv|G|Wa|Wb] (detached): G = Wg, or with the v44 sigmoid gate
+    /// the low-rank product Wd·Wu as one [d, d] matrix; and whether the gate is the sigmoid (the kernels' _sg form).
+    pub(crate) fn gate_cols(&self) -> Result<(Tensor, bool)> {
+        match (&self.wg, &self.wgl) {
+            (Some(wg), _) => Ok((wg.detach(), false)),
+            (None, Some((wd, wu))) => Ok((wd.detach().matmul(&wu.detach())?, true)),
+            (None, None) => candle_core::bail!("D has an output gate"),
+        }
     }
 }
 
 /// log(sigmoid(x)) = -(relu(-x) + ln(1 + exp(-|x|))), stable for any x.
-fn log_sigmoid(x: &Tensor) -> Result<Tensor> {
+pub(crate) fn log_sigmoid(x: &Tensor) -> Result<Tensor> {
     let soft = (x.abs()?.neg()?.exp()? + 1.0)?.log()?;
     x.neg()?.relu()?.add(&soft)?.neg()
 }
@@ -545,19 +636,19 @@ fn hebb_gates(h: &Tensor, g: &Gates) -> Result<(Tensor, Tensor)> {
 /// one projection h·[Wq|Wk|Wv|Wg|Wa|Wb], then unit q/k, gates, delta rule, head norm and silu gate in one kernel).
 fn hebb_infer(h: &Tensor, m: &Hebb, b: usize, t: usize) -> Result<Tensor> {
     let g = m.gates.as_ref().expect("D has gates");
-    let wg = m.wg.as_ref().expect("D has an output gate");
+    let (wg, sg) = m.gate_cols()?; // v44 K2: Wg, or Wd·Wu with the sigmoid kernels
     let nh = h.dim(1)? / HEAD_SIZE;
-    let wcat = Tensor::cat(&[&m.wq.detach(), &m.wk.detach(), &m.wv.detach(), &wg.detach(), &g.wa.detach(), &g.wb.detach()], 1)?;
+    let wcat = Tensor::cat(&[&m.wq.detach(), &m.wk.detach(), &m.wv.detach(), &wg, &g.wa.detach(), &g.wb.detach()], 1)?;
     let cst = Tensor::cat(&[&g.ba.detach(), &g.bb.detach(), &g.off], 0)?;
     let p = h.detach().matmul(&wcat)?;
-    let (o, _ck) = crate::fused::hebb_fwd_raw(&p, &cst, b, t, nh, NORM_EPS)?;
+    let (o, _ck) = crate::fused::hebb_fwd_raw_g(&p, &cst, b, t, nh, NORM_EPS, false, sg)?;
     o.matmul(&m.wo.detach())
 }
 
 fn hebb(h: &Tensor, m: &Hebb, b: usize, t: usize, decay: &Tensor) -> Result<Tensor> {
     let d = h.dim(1)?;
     let nh = d / HEAD_SIZE;
-    let heads = |w: &Tensor| -> Result<Tensor> { h.matmul(w)?.reshape((b, t, nh, HEAD_SIZE))?.transpose(1, 2)?.contiguous() };
+    let heads = |w: &Tensor| -> Result<Tensor> { crate::int8::mm(&h, w)?.reshape((b, t, nh, HEAD_SIZE))?.transpose(1, 2)?.contiguous() };
     let (mut q, mut k, v) = (heads(&m.wq)?, heads(&m.wk)?, heads(&m.wv)?);
     if m.qk_norm {
         q = l2_norm(&q)?;
@@ -576,7 +667,7 @@ fn hebb(h: &Tensor, m: &Hebb, b: usize, t: usize, decay: &Tensor) -> Result<Tens
             delta_rule(&q, &k, &v, &la, &beta)?
         };
         let y = head_norm(&y)?;
-        return out_gate(&y.transpose(1, 2)?.contiguous()?.reshape((b * t, d))?, h, m)?.matmul(&m.wo);
+        return crate::int8::mm(&out_gate(&y.transpose(1, 2)?.contiguous()?.reshape((b * t, d))?, h, m)?, &m.wo);
     }
     if let Some(g) = m.gates.as_ref().filter(|_| crate::gla_on() && h.device().is_cuda() && HEAD_SIZE == crate::fused::ATTN_HS) {
         // Speed round 10: the same read as below in one fused op, no [T, T] tensors (beta folded into k).
@@ -586,7 +677,7 @@ fn hebb(h: &Tensor, m: &Hebb, b: usize, t: usize, decay: &Tensor) -> Result<Tens
         let kb = k.broadcast_mul(&per_head(beta)?.unsqueeze(3)?)?;
         let vc = Tensor::cat(&[&v, &c.unsqueeze(3)?], 3)?;
         let y = head_norm(&crate::fused::gla(&q, &kb, &vc, 1.0 / (HEAD_SIZE as f64).sqrt())?)?;
-        return out_gate(&y.transpose(1, 2)?.contiguous()?.reshape((b * t, d))?, h, m)?.matmul(&m.wo);
+        return crate::int8::mm(&out_gate(&y.transpose(1, 2)?.contiguous()?.reshape((b * t, d))?, h, m)?, &m.wo);
     }
     let sc = q.matmul(&k.t()?.contiguous()?)?.affine(1.0 / (HEAD_SIZE as f64).sqrt(), 0.0)?;
     let w = match &m.gates {
@@ -600,13 +691,13 @@ fn hebb(h: &Tensor, m: &Hebb, b: usize, t: usize, decay: &Tensor) -> Result<Tens
         }
     };
     let y = head_norm(&w.matmul(&v)?)?; // [b, nh, t, hs]
-    out_gate(&y.transpose(1, 2)?.contiguous()?.reshape((b * t, d))?, h, m)?.matmul(&m.wo)
+    crate::int8::mm(&out_gate(&y.transpose(1, 2)?.contiguous()?.reshape((b * t, d))?, h, m)?, &m.wo)
 }
 
 /// Mean of every element, as the mean of the row means. candle's mean_all reduces with one GPU block (1 of
 /// 46 SMs): on Ava-M2's [8192, 1536] activity it took 6.6 ms; rows first spreads the work over every SM.
 /// Same value up to float rounding. Used for the logged activity only (it never feeds the loss).
-fn mean_rows_first(x: &Tensor) -> Result<Tensor> {
+pub(crate) fn mean_rows_first(x: &Tensor) -> Result<Tensor> {
     x.mean_keepdim(D::Minus1)?.mean_all()
 }
 
@@ -630,7 +721,7 @@ fn tri_masks(c: usize, dev: &Device) -> Result<(Tensor, Tensor)> {
 /// of the diagonal s-blocks, the inverse of the diagonal 2s-blocks is T - T E T, where E holds A's
 /// lower-left s-block inside each 2s-block (E T E = 0 exactly). log2(c) levels of two matmuls. Unlike
 /// the Neumann series it never forms (-A)^n, whose entries can be huge and cancel when keys repeat.
-fn inv_unit_lower(a: &Tensor, c: usize) -> Result<Tensor> {
+pub(crate) fn inv_unit_lower(a: &Tensor, c: usize) -> Result<Tensor> {
     let dev = a.device();
     let level = |s: usize| -> Result<Tensor> {
         let m: Vec<f32> = (0..c * c)
@@ -639,9 +730,9 @@ fn inv_unit_lower(a: &Tensor, c: usize) -> Result<Tensor> {
                 if i / (2 * s) == j / (2 * s) && (i / s) % 2 == 1 && (j / s) % 2 == 0 { 1.0 } else { 0.0 }
             })
             .collect();
-        a.broadcast_mul(&Tensor::from_vec(m, (c, c), dev)?)
+        a.broadcast_mul(&Tensor::from_vec(m, (c, c), dev)?.to_dtype(a.dtype())?)
     };
-    let mut t = level(1)?.neg()?.broadcast_add(&Tensor::eye(c, DType::F32, dev)?)?;
+    let mut t = level(1)?.neg()?.broadcast_add(&Tensor::eye(c, a.dtype(), dev)?)?;
     let mut s = 2;
     while s < c {
         t = t.sub(&t.matmul(&level(s)?)?.matmul(&t)?)?;
@@ -662,6 +753,12 @@ fn inv_unit_lower(a: &Tensor, c: usize) -> Result<Tensor> {
 /// q, k, v [b, nh, t, hs] (q and k unit length); log alpha and beta [b, nh, t]. Returns y [b, nh, t, hs].
 /// Heads are folded into the batch (CUDA batched matmul takes at most two batch dimensions).
 pub fn delta_rule(q: &Tensor, k: &Tensor, v: &Tensor, la: &Tensor, beta: &Tensor) -> Result<Tensor> {
+    Ok(delta_rule_from(q, k, v, la, beta, None)?.0)
+}
+
+/// v42: `delta_rule` from the fast weights `f0` [b·nh, hs, hs] (None: 0, the same ops as before), also returning the
+/// fast weights after the window (O1 carries them from chunk to chunk). Any head size (P1's CPU path).
+pub fn delta_rule_from(q: &Tensor, k: &Tensor, v: &Tensor, la: &Tensor, beta: &Tensor, f0: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
     let (b, nh, t, hs) = q.dims4()?;
     let dev = q.device();
     let (c, bn) = (chunk_len(t), b * nh);
@@ -671,8 +768,9 @@ pub fn delta_rule(q: &Tensor, k: &Tensor, v: &Tensor, la: &Tensor, beta: &Tensor
     let bc = beta.reshape((bn, nc, c))?.unsqueeze(3)?; // [bn, nc, c, 1]
     let cum = la.reshape((bn, nc, c))?.cumsum(2)?; // log Gamma, restarting every chunk
     let (strict, incl) = tri_masks(c, dev)?;
+    let (strict, incl) = (strict.to_dtype(q.dtype())?, incl.to_dtype(q.dtype())?); // v51 fast1: f64 on the CPU
     // D o M: exp(cum_i - cum_j) on/below the diagonal, 0 above (exp of a large negative)
-    let dmat = cum.unsqueeze(3)?.broadcast_sub(&cum.unsqueeze(2)?)?.broadcast_add(&causal_mask(c, dev)?)?.exp()?;
+    let dmat = cum.unsqueeze(3)?.broadcast_sub(&cum.unsqueeze(2)?)?.broadcast_add(&causal_mask(c, dev)?.to_dtype(q.dtype())?)?.exp()?;
     let kt = k.transpose(2, 3)?.contiguous()?; // [bn, nc, hs, c]
     let a = k.matmul(&kt)?.broadcast_mul(&bc)?.broadcast_mul(&strict)?;
     let w = inv_unit_lower(&a, c)?.matmul(&k.broadcast_mul(&bc)?)?;
@@ -683,7 +781,10 @@ pub fn delta_rule(q: &Tensor, k: &Tensor, v: &Tensor, la: &Tensor, beta: &Tensor
     let last = cum.narrow(2, c - 1, 1)?; // [bn, nc, 1]
     let tail = last.broadcast_sub(&cum)?.exp()?.unsqueeze(3)?; // Gamma_c / Gamma_j, [bn, nc, c, 1]
     let gam_c = last.exp()?.unsqueeze(3)?; // [bn, nc, 1, 1]
-    let mut f = Tensor::zeros((bn, hs, hs), DType::F32, dev)?;
+    let mut f = match f0 {
+        Some(f0) => f0.clone(),
+        None => Tensor::zeros((bn, hs, hs), q.dtype(), dev)?,
+    };
     let mut ys = Vec::with_capacity(nc);
     for r in 0..nc {
         let at = |x: &Tensor| -> Result<Tensor> { x.narrow(1, r, 1)?.squeeze(1) };
@@ -694,7 +795,7 @@ pub fn delta_rule(q: &Tensor, k: &Tensor, v: &Tensor, la: &Tensor, beta: &Tensor
         let fresh = ktr.matmul(&at(&u)?.broadcast_mul(&at(&tail)?)?)?;
         f = f.sub(&ktr.matmul(&wf)?)?.broadcast_mul(&at(&gam_c)?)?.add(&fresh)?;
     }
-    Tensor::cat(&ys, 1)?.reshape((b, nh, t, hs))
+    Ok((Tensor::cat(&ys, 1)?.reshape((b, nh, t, hs))?, f))
 }
 
 impl Model {
@@ -716,12 +817,15 @@ impl Model {
         for i in 0..cfg.layers {
             let mem = if cfg.kind.is_ava() {
                 let vm = vb.pp(format!("b{i}.mem"));
-                Some(SpikeMem {
-                    norm: vm.get_with_hints(d, "norm", Init::Const(1.0))?,
-                    win: vm.get_with_hints((d, d), "win", randn(1.0 / (d as f64).sqrt()))?,
-                    beta: vm.get_with_hints(d, "beta", Init::Const(logit(LIF_BETA0)))?,
-                    wout: vm.get_with_hints((d, d), "wout", randn(rs))?,
-                })
+                let norm = vm.get_with_hints(d, "norm", Init::Const(1.0))?;
+                let win = vm.get_with_hints((d, d), "win", randn(1.0 / (d as f64).sqrt()))?;
+                // v42 (R3, --lif-init logspaced): a fresh variable gets log-spaced leaks (a set, no random draws)
+                let fresh = !vm.contains_tensor("beta");
+                let beta = vm.get_with_hints(d, "beta", Init::Const(logit(LIF_BETA0)))?;
+                if cfg.arch.lif_logspaced && fresh {
+                    crate::arch::set_logspaced_beta(&beta, d, vb.device())?;
+                }
+                Some(SpikeMem { norm, win, beta, wout: vm.get_with_hints((d, d), "wout", randn(rs))? })
             } else {
                 None
             };
@@ -747,18 +851,29 @@ impl Model {
                     wv: vh.get_with_hints((d, d), "wv", randn(INIT_STD))?,
                     wo: vh.get_with_hints((d, d), "wo", randn(rs))?,
                     gates: if matches!(cfg.kind, Kind::G | Kind::R | Kind::D | Kind::A) {
-                        let off: Vec<f32> = hebb_gammas(nh).into_iter().map(|g| logit(g) as f32).collect();
+                        // v42 (P1): --timescales fixed spreads them log-spaced; `index` is hebb_gammas exactly
+                        let off: Vec<f32> = crate::arch::gate_gammas(nh, cfg.arch.timescales).into_iter().map(|g| logit(g) as f32).collect();
                         Some(Gates {
                             wa: vh.get_with_hints((d, nh), "wa", Init::Const(0.0))?,
                             ba: vh.get_with_hints(nh, "ba", Init::Const(0.0))?,
                             wb: vh.get_with_hints((d, nh), "wb", Init::Const(0.0))?,
                             bb: vh.get_with_hints(nh, "bb", Init::Const(0.0))?,
-                            off: Tensor::from_vec(off, nh, vb.device())?,
+                            off: Tensor::from_vec(off, nh, vb.device())?.to_dtype(vb.dtype())?,
                         })
                     } else {
                         None
                     },
-                    wg: if matches!(cfg.kind, Kind::R | Kind::D | Kind::A) { Some(vh.get_with_hints((d, d), "wg", randn(INIT_STD))?) } else { None },
+                    wg: if !matches!(cfg.kind, Kind::R | Kind::D | Kind::A) {
+                        None
+                    } else if cfg.arch.gate == crate::arch::OutGate::Sigmoid {
+                        // v44 K2: no Wg; its random numbers are drawn and dropped, so every later weight gets the init
+                        // it gets without the option (the low-rank gate is made last, in arch::build_ext)
+                        drop(randn(INIT_STD).var((d, d), DType::F32, vb.device())?);
+                        None
+                    } else {
+                        Some(vh.get_with_hints((d, d), "wg", randn(INIT_STD))?)
+                    },
+                    wgl: None,
                     qk_norm: matches!(cfg.kind, Kind::R | Kind::D | Kind::A),
                     delta: matches!(cfg.kind, Kind::D | Kind::A),
                 })
@@ -769,7 +884,8 @@ impl Model {
             let mlp = Mlp {
                 norm: vl.get_with_hints(d, "norm", Init::Const(1.0))?,
                 w1: vl.get_with_hints((d, hid), "w1", randn(INIT_STD))?,
-                w2: vl.get_with_hints((hid, d), "w2", randn(rs))?,
+                // v50 (--dale, src/v50.rs): its v in W2's place, from the same random draws; today's w2 without it
+                w2: crate::v50::mlp_w2_param(&cfg, &vl, rs)?,
             };
             // v40: the engram read; its output projection starts at 0, so the block starts exactly as without it
             let eng = if cfg.engram == Some(i) {
@@ -787,6 +903,19 @@ impl Model {
             blocks.push(Block { mem, attn, hebb, eng, mlp });
         }
         let final_norm = vb.get_with_hints(d, "final.norm", Init::Const(1.0))?;
+        // v42 (Wave 2B): the block options' new tensors, after all of today's (the same random draws for those)
+        let ext = crate::arch::build_ext(&cfg, &vb)?;
+        // v44 K2 (--gate sigmoid): the low-rank gate, made after everything else (as the block options' tensors are), so
+        // every other weight gets the init it gets without the option
+        if cfg.arch.gate == crate::arch::OutGate::Sigmoid {
+            let r = cfg.arch.gate_rank;
+            for (i, blk) in blocks.iter_mut().enumerate() {
+                if let Some(hb) = blk.hebb.as_mut() {
+                    let vh = vb.pp(format!("b{i}.hebb"));
+                    hb.wgl = Some((vh.get_with_hints((d, r), "wgd", randn(INIT_STD))?, vh.get_with_hints((r, d), "wgu", randn(INIT_STD))?));
+                }
+            }
+        }
         Ok(Model {
             cfg,
             tok,
@@ -798,14 +927,99 @@ impl Model {
             final_norm,
             track: std::cell::Cell::new(true),
             infer: std::cell::Cell::new(false),
+            ext,
+            force_arch: std::cell::Cell::new(false),
+            train_fwd: std::cell::Cell::new(false),
+            q8: std::cell::RefCell::new(None),
+            fused: std::cell::Cell::new(false),
+            fast4: std::cell::Cell::new(false),
+            trace_rec: std::cell::RefCell::new(None),
         })
+    }
+
+    /// E10 (src/int8.rs): talk with int8 weights on the CPU (off by default). On builds the int8 copies once, from the
+    /// weights as they are now: every block's LIF in/out projections, the fast-weight memory's q, k, v, gate and out
+    /// (and the channel gates' erase keys), the attention and engram projections, the MLP's w1 and w2, and the output
+    /// head (the tied embedding, transposed; the input lookup stays f32). Norms, thresholds, leaks, gate vectors, the
+    /// small gate projections and the Wave 5 parts stay f32. `forward`, `step`, `step_trace`, `forward_trace` and
+    /// `forward_with_state` then use them; off drops them, and every output is again bit for bit the f32 one. For
+    /// inference only: no gradient flows through an int8 matmul, and the copies do not follow later weight changes
+    /// (call `set_int8(true)` again after changing the weights). The matmuls use up to `threads` threads (0: candle's
+    /// count, as --threads sets it).
+    pub fn set_int8(&self, on: bool) -> Result<()> {
+        self.set_int8_threads(on, 0)
+    }
+
+    /// `set_int8` with an explicit thread count for the int8 matmuls (0: candle's count).
+    pub fn set_int8_threads(&self, on: bool, threads: usize) -> Result<()> {
+        if !on {
+            *self.q8.borrow_mut() = None;
+            return Ok(());
+        }
+        if !self.tok.device().is_cpu() {
+            candle_core::bail!("set_int8: the int8 talking path runs on the CPU only (this model is on {:?})", self.tok.device().location());
+        }
+        let threads = if threads == 0 { candle_core::utils::get_num_threads() } else { threads };
+        let mut set = crate::int8::Q8Set::new(threads);
+        for (i, blk) in self.blocks.iter().enumerate() {
+            if let Some(m) = &blk.mem {
+                set.add(&m.win)?;
+                set.add(&m.wout)?;
+            }
+            if let Some(hb) = &blk.hebb {
+                for w in [&hb.wq, &hb.wk, &hb.wv, &hb.wo] {
+                    set.add(w)?;
+                }
+                if let Some(wg) = &hb.wg {
+                    set.add(wg)?;
+                }
+            }
+            for a in blk.attn.iter().chain(blk.eng.iter()) {
+                for w in [&a.wq, &a.wk, &a.wv, &a.wo] {
+                    set.add(w)?;
+                }
+            }
+            set.add(&blk.mlp.w1)?;
+            set.add(&blk.mlp.w2)?;
+            if let Some(c) = self.ext.as_ref().and_then(|e| e.blocks.get(i)).and_then(|b| b.chan.as_ref()) {
+                set.add(&c.we)?;
+            }
+        }
+        set.set_head(&self.tok)?;
+        *self.q8.borrow_mut() = Some(std::sync::Arc::new(set));
+        Ok(())
+    }
+
+    /// E10: whether the int8 talking path is on.
+    pub fn int8(&self) -> bool {
+        self.q8.borrow().is_some()
+    }
+
+    /// E10: (matrices, bytes) of the int8 copies (0, 0 when off).
+    pub fn int8_size(&self) -> (usize, usize) {
+        self.q8.borrow().as_ref().map_or((0, 0), |s| s.size())
+    }
+
+    /// Holds this model's int8 set (None when off) on this thread for one forward or step (src/int8.rs).
+    pub(crate) fn int8_scope(&self) -> crate::int8::Scope {
+        crate::int8::scope(self.q8.borrow().clone())
+    }
+
+    /// Tests only: run this model through the block-options forward (`forward_arch`) even with today's block.
+    pub fn set_force_arch(&self, on: bool) {
+        self.force_arch.set(on);
+    }
+
+    /// v42: whether this model runs the block-options forward (some option of `cfg.arch` is on).
+    pub fn arch_path(&self) -> bool {
+        self.ext.is_some() || self.force_arch.get()
     }
 
     /// v39: the place lookup table [PLACES + 1, d]: the place embedding plus a zero row for "none" (16), so
     /// non-digits get exactly 0 added. Built from the parameter (autograd flows into rows 0..16 only).
-    fn place_table(place: &Tensor) -> Result<Tensor> {
+    pub(crate) fn place_table(place: &Tensor) -> Result<Tensor> {
         let d = place.dim(1)?;
-        Tensor::cat(&[place, &Tensor::zeros((1, d), DType::F32, place.device())?], 0)
+        Tensor::cat(&[place, &Tensor::zeros((1, d), place.dtype(), place.device())?], 0)
     }
 
     /// v40 lesion study: switch off the place code, the magnitude code and/or the engram read (each then adds 0).
@@ -817,13 +1031,18 @@ impl Model {
     /// v40: the engram read for the normed input h [B·T, d]: causal attention over every earlier token's key and
     /// value (heads of 32), then Wo. On CUDA this is the fused flash-style kernel (no T×T matrix, so whole books
     /// fit; the mask is not used there); on the CPU candle's chain with the mask (the same maths).
-    fn engram_read(&self, h: &Tensor, e: &Attn, b: usize, t: usize) -> Result<Tensor> {
+    pub(crate) fn engram_read(&self, h: &Tensor, e: &Attn, b: usize, t: usize) -> Result<Tensor> {
+        self.engram_read_g(h, e, b, t, None)
+    }
+
+    /// `engram_read` with v45 W4's output gate [B·T, heads or d] on the heads before Wo (None: `engram_read`).
+    pub(crate) fn engram_read_g(&self, h: &Tensor, e: &Attn, b: usize, t: usize, gate: Option<&Tensor>) -> Result<Tensor> {
         let mask = if crate::fast_path() && h.device().is_cuda() && HEAD_SIZE == crate::fused::ATTN_HS {
             Tensor::zeros(1, DType::F32, h.device())?
         } else {
             causal_mask(t, h.device())?
         };
-        attention(h, e, b, t, &mask)
+        attention_g(h, e, b, t, &mask, gate)
     }
 
     /// Compute the logged activity means in forward (default on).
@@ -839,11 +1058,33 @@ impl Model {
 
     /// Whether the parameter called `name` gets weight decay (the weight matrices only).
     pub fn decays(name: &str) -> bool {
-        [".win", ".wout", ".w1", ".w2", ".wq", ".wk", ".wv", ".wo"].iter().any(|s| name.ends_with(s))
+        // v42: ".we" is the per-channel memory's erase-key matrix (--gates channel); today's models have none
+        [".win", ".wout", ".w1", ".w2", ".wq", ".wk", ".wv", ".wo", ".we"].iter().any(|s| name.ends_with(s))
+    }
+
+    /// v42 (W1): `decays`, plus with `gates` the fast-weight memory's output gate `.wg` [d, d] (R, D, A). The list in
+    /// `decays` was written before the output gate existed, so the gate (6.6% of a D model's weights) never got
+    /// weight decay: a bug, kept as the default so past runs stay bit-reproducible (`--decay-gates` turns it on).
+    /// `.wa` and `.wb` stay undecayed on purpose: they are the [d, heads] projections behind the per-head forget and
+    /// write gates, and they start at exactly 0, where each head forgets at its hand-set time-scale (the gate offset).
+    /// Decay would keep pulling the memory back to fixed time-scales, the thing these gates exist to learn; they
+    /// act like the gate biases `.ba`/`.bb` (not decayed either) and hold only 1/16 of one d×d matrix per block.
+    pub fn decays_with(name: &str, gates: bool) -> bool {
+        // v44 K2: the low-rank sigmoid gate (.wgd, .wgu) follows the rule of the .wg it replaces; v45 W4: so does the
+        // engram's output gate (.wth)
+        Self::decays(name) || (gates && [".wg", ".wgd", ".wgu", ".wth"].iter().any(|s| name.ends_with(s)))
     }
 
     /// Logits [B·T, V] for `ids` [B, T] (u32), plus per-layer activity means (S only).
     pub fn forward_with_activity(&self, ids: &Tensor) -> Result<(Tensor, Activity)> {
+        let _q8 = self.int8_scope(); // E10: the int8 copies while on (src/int8.rs)
+        if self.arch_path() {
+            // v42: a model with block options (src/arch.rs); today's model never comes here
+            let (x, act) = self.forward_arch(ids)?;
+            let logits = crate::int8::head(&x, &self.tok)?;
+            self.stash_logits(&logits); // src/wave5.rs: B2/C8 read them in training forwards
+            return Ok((logits, act));
+        }
         let (b, t) = ids.dims2()?;
         let d = self.cfg.d;
         let n = b * t;
@@ -877,12 +1118,12 @@ impl Model {
         for blk in &self.blocks {
             if let Some(m) = &blk.mem {
                 let h = norm(&x, &m.norm)?;
-                let cur = h.matmul(&m.win)?.reshape((b, t, d))?;
+                let cur = crate::int8::mm(&h, &m.win)?.reshape((b, t, d))?;
                 let s = lif_scan(&cur, &m.beta)?;
                 if self.track.get() {
                     act.spike_rate.push(mean_rows_first(&s.detach())?);
                 }
-                let o = s.reshape((n, d))?.matmul(&m.wout)?;
+                let o = crate::int8::mm(&s.reshape((n, d))?, &m.wout)?;
                 x = x.add(&o)?;
             }
             if let (Some(hb), Some(decay)) = (&blk.hebb, &decay) {
@@ -904,7 +1145,7 @@ impl Model {
             }
             let l = &blk.mlp;
             let h = norm(&x, &l.norm)?;
-            let u = h.matmul(&l.w1)?;
+            let u = crate::int8::mm(&h, &l.w1)?;
             let a = if self.cfg.kind.is_ava() {
                 let a = if crate::fast_path() && u.device().is_cuda() {
                     crate::fused::kwta_relu(&u, self.cfg.kwta_k())?
@@ -920,10 +1161,10 @@ impl Model {
             } else {
                 u.gelu()?
             };
-            x = x.add(&a.matmul(&l.w2)?)?;
+            x = x.add(&crate::int8::mm(&a, &l.w2)?)?;
         }
         let x = norm(&x, &self.final_norm)?;
-        let logits = x.matmul(&self.tok.t()?)?;
+        let logits = crate::int8::head(&x, &self.tok)?;
         Ok((logits, act))
     }
 
@@ -937,6 +1178,10 @@ impl Model {
         if !self.cfg.kind.is_ava() {
             candle_core::bail!("stream: only Ava (every kind but T) carries a recurrent state (T needs its window)");
         }
+        if self.arch_path() {
+            // v42 (S1): the block options step through forward_with_state with a one-row State
+            return self.stream_batched();
+        }
         let dev = self.tok.device();
         let nh = self.cfg.heads();
         let gamma = if self.cfg.kind == Kind::F {
@@ -945,7 +1190,7 @@ impl Model {
         } else {
             None
         };
-        let mut st = Stream { beta: Vec::new(), v: Vec::new(), s: Vec::new(), fw: Vec::new(), gamma, kv: Vec::new(), seen: 0, place_len: 0, place_idx: 0, ekv: None, hist: Vec::new() };
+        let mut st = Stream { beta: Vec::new(), v: Vec::new(), s: Vec::new(), fw: Vec::new(), gamma, kv: Vec::new(), seen: 0, place_len: 0, place_idx: 0, ekv: None, hist: Vec::new(), st: None };
         for blk in &self.blocks {
             let m = blk.mem.as_ref().expect("Ava block has SpikeMem");
             st.beta.push(sigmoid(&m.beta)?.unsqueeze(0)?); // [1, d], the value lif_scan uses
@@ -960,12 +1205,77 @@ impl Model {
         Ok(st)
     }
 
+    /// v42 (S1): a stream backed by a one-row State (src/state.rs) for S, D, A and T: `feed` then reads a whole prompt
+    /// in one batched pass (the chunked delta rule) instead of token by token. Opt-in: `stream` keeps today's
+    /// token-by-token stream for today's models (the two agree up to float rounding).
+    pub fn stream_batched(&self) -> Result<Stream> {
+        let st = self.state(1)?;
+        Ok(Stream { beta: Vec::new(), v: Vec::new(), s: Vec::new(), fw: Vec::new(), gamma: None, kv: Vec::new(), seen: 0, place_len: 0, place_idx: 0, ekv: None, hist: Vec::new(), st: Some(st) })
+    }
+
+    /// v42 (S1): feed `toks` and return the logits [V] after the last one. A State-backed stream reads them in one
+    /// batched pass; today's stream steps through them one by one (as before).
+    pub fn feed(&self, st: &mut Stream, toks: &[u32]) -> Result<Tensor> {
+        if toks.is_empty() {
+            candle_core::bail!("feed: no tokens");
+        }
+        if let Some(s) = st.st.as_mut() {
+            let n = toks.len();
+            let l = self.forward_with_state(&Tensor::from_vec(toks.to_vec(), (1, n), self.tok.device())?, s)?;
+            st.seen += n;
+            return l.get(n - 1);
+        }
+        let mut last = None;
+        for &t in toks {
+            last = Some(self.step(st, t)?);
+        }
+        Ok(last.expect("at least one token"))
+    }
+
+    /// v42 (S1/S2): the carried State of a State-backed stream (to save it per conversation, or copy it), if any.
+    pub fn stream_state(st: &Stream) -> Option<&crate::state::State> {
+        st.st.as_ref()
+    }
+
+    /// v42 (S2): the same, to change (e.g. its engram cap).
+    pub fn stream_state_mut(st: &mut Stream) -> Option<&mut crate::state::State> {
+        st.st.as_mut()
+    }
+
+    /// v42 (S2): a State-backed stream resuming `state` (one row), e.g. a conversation's saved state.
+    pub fn stream_from(&self, state: crate::state::State) -> Result<Stream> {
+        if state.rows() != 1 {
+            candle_core::bail!("stream_from: a one-row state (this one has {} rows)", state.rows());
+        }
+        let mut s = self.stream_batched()?;
+        s.seen = state.seen[0];
+        s.st = Some(state);
+        Ok(s)
+    }
+
     /// Feed one token and return the logits [V] for the next one. The LIF membranes carry over from the
     /// previous call, so a token costs one position of work instead of a whole window. Same arithmetic as
     /// `forward` over the full history (no window cut): the membrane update repeats the fused kernel's
     /// rounding step for step; matmuls of one row may round differently from a whole window's.
     pub fn step(&self, st: &mut Stream, tok: u32) -> Result<Tensor> {
+        let _q8 = self.int8_scope();
         let dev = self.tok.device();
+        if let Some(s) = st.st.as_mut() {
+            // v42 (S1): a State-backed stream; the fused step for block options (src/model/fstep/arch.rs) when on
+            if let Some(l) = if self.fused.get() { fstep::arch::step(self, s, tok)? } else { None } {
+                st.seen += 1;
+                return Ok(l);
+            }
+            let l = self.forward_with_state(&Tensor::new(&[[tok]], dev)?, s)?;
+            st.seen += 1;
+            return l.squeeze(0);
+        }
+        if self.fused.get() {
+            // the fused CPU step (src/model/fstep.rs): the same bits; None where it does not apply
+            if let Some(l) = fstep::step(self, st, tok)? {
+                return Ok(l);
+            }
+        }
         let mut x = self.tok.embedding(&Tensor::new(&[tok], dev)?)?; // [1, d]
         let (place_off, mag_off, eng_off) = self.lesion.get();
         let p = st.next_place(tok) as usize;
@@ -986,25 +1296,25 @@ impl Model {
         for (i, blk) in self.blocks.iter().enumerate() {
             let m = blk.mem.as_ref().expect("S block has SpikeMem");
             let h = rmsnorm(&x, &m.norm)?;
-            let cur = h.matmul(&m.win)?;
+            let cur = crate::int8::mm(&h, &m.win)?;
             // ((beta·v + I) − theta·s), each step rounded, as lif_fwd does.
             let v = st.v[i].mul(&st.beta[i])?.add(&cur)?.sub(&st.s[i].affine(LIF_THRESHOLD, 0.0)?)?;
             let s = v.affine(1.0, -LIF_THRESHOLD)?.ge(0.0)?.to_dtype(DType::F32)?;
-            x = x.add(&s.matmul(&m.wout)?)?;
+            x = x.add(&crate::int8::mm(&s, &m.wout)?)?;
             st.v[i] = v;
             st.s[i] = s;
             if let Some(hb) = &blk.hebb {
                 // F <- alpha·F + beta·k v^T (Hebbian imprint), then read q·F / sqrt(hs).
                 let nh = self.cfg.heads();
                 let h = rmsnorm(&x, &hb.norm)?;
-                let (mut q, mut k) = (h.matmul(&hb.wq)?.reshape((nh, 1, HEAD_SIZE))?, h.matmul(&hb.wk)?.reshape((nh, 1, HEAD_SIZE))?);
+                let (mut q, mut k) = (crate::int8::mm(&h, &hb.wq)?.reshape((nh, 1, HEAD_SIZE))?, crate::int8::mm(&h, &hb.wk)?.reshape((nh, 1, HEAD_SIZE))?);
                 if hb.qk_norm {
                     q = l2_norm(&q)?;
                     k = l2_norm(&k)?;
                 }
                 let k_row = k.clone();
                 let k = k.reshape((nh, HEAD_SIZE, 1))?;
-                let v = h.matmul(&hb.wv)?.reshape((nh, 1, HEAD_SIZE))?;
+                let v = crate::int8::mm(&h, &hb.wv)?.reshape((nh, 1, HEAD_SIZE))?;
                 let imprint = k.matmul(&v)?;
                 let fw = match (&hb.gates, &st.gamma) {
                     (Some(g), _) if hb.delta => {
@@ -1025,14 +1335,14 @@ impl Model {
                 };
                 let read = q.matmul(&fw)?;
                 let y = head_norm(&if hb.delta { read } else { read.affine(1.0 / (HEAD_SIZE as f64).sqrt(), 0.0)? })?;
-                x = x.add(&out_gate(&y.reshape((1, self.cfg.d))?, &h, hb)?.matmul(&hb.wo)?)?;
+                x = x.add(&crate::int8::mm(&out_gate(&y.reshape((1, self.cfg.d))?, &h, hb)?, &hb.wo)?)?;
                 st.fw[i] = fw;
             }
             if let Some(a) = &blk.attn {
                 // A: causal attention over every token so far (keys and values cached), the same maths as `attention`.
                 let nh = self.cfg.heads();
                 let h = rmsnorm(&x, &a.norm)?;
-                let head = |w: &Tensor| -> Result<Tensor> { h.matmul(w)?.reshape((nh, 1, HEAD_SIZE)) };
+                let head = |w: &Tensor| -> Result<Tensor> { crate::int8::mm(&h, w)?.reshape((nh, 1, HEAD_SIZE)) };
                 let (q, k, v) = (head(&a.wq)?, head(&a.wk)?, head(&a.wv)?);
                 let (kc, vc) = match st.kv[i].take() {
                     None => (k, v),
@@ -1040,7 +1350,7 @@ impl Model {
                 };
                 let sc = q.matmul(&kc.t()?.contiguous()?)?.affine(1.0 / (HEAD_SIZE as f64).sqrt(), 0.0)?; // [nh, 1, seen]
                 let o = candle_nn::ops::softmax(&sc, D::Minus1)?.matmul(&vc)?; // [nh, 1, hs]
-                x = x.add(&o.reshape((1, self.cfg.d))?.matmul(&a.wo)?)?;
+                x = x.add(&crate::int8::mm(&o.reshape((1, self.cfg.d))?, &a.wo)?)?;
                 st.kv[i] = Some((kc, vc));
             }
             if let Some(e) = &blk.eng {
@@ -1048,7 +1358,7 @@ impl Model {
                 // back on mid-text reads the whole past; when lesioned it adds nothing)
                 let nh = self.cfg.heads();
                 let h = rmsnorm(&x, &e.norm)?;
-                let head = |w: &Tensor| -> Result<Tensor> { h.matmul(w)?.reshape((nh, 1, HEAD_SIZE)) };
+                let head = |w: &Tensor| -> Result<Tensor> { crate::int8::mm(&h, w)?.reshape((nh, 1, HEAD_SIZE)) };
                 let (q, k, v) = (head(&e.wq)?, head(&e.wk)?, head(&e.wv)?);
                 let (kc, vc) = match st.ekv.take() {
                     None => (k, v),
@@ -1057,19 +1367,19 @@ impl Model {
                 if !eng_off {
                     let sc = q.matmul(&kc.t()?.contiguous()?)?.affine(1.0 / (HEAD_SIZE as f64).sqrt(), 0.0)?;
                     let o = candle_nn::ops::softmax(&sc, D::Minus1)?.matmul(&vc)?;
-                    x = x.add(&o.reshape((1, self.cfg.d))?.matmul(&e.wo)?)?;
+                    x = x.add(&crate::int8::mm(&o.reshape((1, self.cfg.d))?, &e.wo)?)?;
                 }
                 st.ekv = Some((kc, vc));
             }
             let l = &blk.mlp;
             let h = rmsnorm(&x, &l.norm)?;
-            let u = h.matmul(&l.w1)?;
+            let u = crate::int8::mm(&h, &l.w1)?;
             let a = u.mul(&kwta_mask(&u, self.cfg.kwta_k())?)?.relu()?;
-            x = x.add(&a.matmul(&l.w2)?)?;
+            x = x.add(&crate::int8::mm(&a, &l.w2)?)?;
         }
         st.seen += 1;
         let x = rmsnorm(&x, &self.final_norm)?;
-        x.matmul(&self.tok.t()?)?.squeeze(0)
+        crate::int8::head(&x, &self.tok)?.squeeze(0)
     }
 
     /// Mean cross-entropy (f32 nats/token) of `ids` [B, T] against `targets` [B, T].
@@ -1092,8 +1402,14 @@ impl Model {
             || std::env::var("AVA_MANUAL_BWD").is_ok_and(|v| v == "0")
             || !ids.device().is_cuda()
             || std::env::var_os("AVA_GPU_CANDLE_CE").is_some()
+            || (self.arch_path() && !self.win_step(ids))
         {
+            // (v42: a model with block options trains through candle's autograd; v47: but D with Stage 3's winners only
+            // has its own hand-written step, src/model/fwin.rs, unless AVA_WIN_FUSED=0 or AVA_MANUAL_DA=0)
             return Ok(None);
+        }
+        if self.arch_path() {
+            return Ok(Some(self.loss_and_grads_win(ids, targets, None, false, &Mm { bf16 })?));
         }
         if matches!(self.cfg.kind, Kind::D | Kind::A) {
             // speed round 12: bf16 only; otherwise the autograd path
@@ -1458,11 +1774,41 @@ impl Model {
     /// not normalised: loss = sum(w·loss), row gradient scale = w. A negative weight pushes the target's
     /// probability down (REINFORCE with the outcome as the weight); the caller divides by its own count.
     pub fn loss_and_grads_a_wr(&self, ids: &Tensor, targets: &Tensor, wt: Option<&Tensor>, raw: bool, mm: &Mm) -> Result<(Tensor, Activity, GradStore)> {
+        if self.arch_path() {
+            // v42: the block options have no hand-written step; the same loss and weights through autograd (v47: except
+            // D with Stage 3's winners only, src/model/fwin.rs)
+            if self.win_step(ids) {
+                return self.loss_and_grads_win(ids, targets, wt, raw, mm);
+            }
+            return self.loss_and_grads_autograd(ids, targets, wt, raw);
+        }
+        match self.a_pass(ids, Some(targets), wt, raw, mm)? {
+            fwin::WinOut::Step(loss, act, grads) => Ok((loss, act, grads)),
+            fwin::WinOut::Logits(_) => candle_core::bail!("loss_and_grads_a_wr: the pass stopped at the logits"),
+        }
+    }
+
+    /// v52 fasteval (runs/v52/fasteval.md): the forward half of the D/A step above (today's block, no block options),
+    /// for scoring: the same ops on the same operands up to the logits [N, V] f32, then stop; nothing kept for a
+    /// backward, no activity tracked. `mm` f32 gives the reference forward's numbers up to rounding.
+    pub fn logits_a(&self, ids: &Tensor, mm: &Mm) -> Result<Tensor> {
+        if self.arch_path() {
+            candle_core::bail!("logits_a: a model with block options (Model::logits_win)");
+        }
+        match self.a_pass(ids, None, None, false, mm)? {
+            fwin::WinOut::Logits(l) => Ok(l),
+            fwin::WinOut::Step(..) => candle_core::bail!("logits_a: the pass did not stop at the logits"),
+        }
+    }
+
+    /// The D/A step's body (today's block): `targets` None = the forward only, up to the logits (logits_a).
+    fn a_pass(&self, ids: &Tensor, targets: Option<&Tensor>, wt: Option<&Tensor>, raw: bool, mm: &Mm) -> Result<fwin::WinOut> {
         use crate::fused::{
             attn_bwd_s, attn_fwd_s, hebb_bwd_raw, hebb_fwd_raw, kwta_relu_b, kwta_relu_raw, lif_bwd_b, lif_fwd_b, relu_mask_bwd_b, relu_mask_bwd_raw,
             rms_bwd_raw, ATTN_HS,
         };
         use crate::lif::{ce_bwd_raw, ce_fwd_raw, lif_bwd_raw, lif_fwd_raw};
+        let fwd = targets.is_none(); // v52 fasteval: forward only
         let (b, t) = ids.dims2()?;
         let (d, n, k, nh) = (self.cfg.d, b * t, self.cfg.kwta_k(), self.cfg.heads());
         if HEAD_SIZE != ATTN_HS {
@@ -1472,15 +1818,15 @@ impl Model {
         let bf = mm.bf16;
         let tc = bf && crate::attn_tc_on();
         let dev = ids.device();
-        let track = self.track.get();
+        let track = self.track.get() && !fwd;
         let mut act = Activity { spike_rate: Vec::new(), kwta_post: Vec::new() };
         let tok = self.tok.detach();
         let tok_b = mm.op(&tok)?;
         let idf = ids.flatten_all()?;
-        let tg = targets.flatten_all()?;
         enum Mid {
             // h: the normed input (an operand), p: the projection (f32), ck: saved states, o: the output (an operand)
-            Hebb { h: Tensor, p: Tensor, cst: Tensor, ck: Tensor, o: Tensor, wcat: Tensor, wo: Tensor },
+            // sg: v44 K2, the sigmoid gate (G = Wd·Wu in wcat; the kernels' _sg form)
+            Hebb { h: Tensor, p: Tensor, cst: Tensor, ck: Tensor, o: Tensor, wcat: Tensor, wo: Tensor, sg: bool },
             // o: attention output f32, ob: the same as an operand
             Attn { h: Tensor, qkv: Tensor, o: Tensor, ob: Tensor, lse: Tensor, wqkv: Tensor, wo: Tensor },
         }
@@ -1543,16 +1889,22 @@ impl Model {
             let x_m1 = x.add(&mm.mm(&s, false, &w[1], false)?)?;
             let (mid, x_m2) = if let Some(hb) = &blk.hebb {
                 let g = hb.gates.as_ref().expect("D has gates");
-                let wg = hb.wg.as_ref().expect("D has an output gate");
-                let wcat = mm.op(&Tensor::cat(&[&hb.wq.detach(), &hb.wk.detach(), &hb.wv.detach(), &wg.detach(), &g.wa.detach(), &g.wb.detach()], 1)?)?;
+                let (wg, sg) = hb.gate_cols()?; // v44 K2: Wg, or Wd·Wu for the sigmoid gate
+                let wcat = mm.op(&Tensor::cat(&[&hb.wq.detach(), &hb.wk.detach(), &hb.wv.detach(), &wg, &g.wa.detach(), &g.wb.detach()], 1)?)?;
                 let cst = Tensor::cat(&[&g.ba.detach(), &g.bb.detach(), &g.off], 0)?;
                 let h = mm.rms(&x_m1, &hb.norm.detach())?;
                 let p = mm.mm(&h, false, &wcat, false)?; // f32 [N, 4d + 2H]
                 // v40: under bf16 the kernel writes O's bf16 operand itself (the same bits as the cast)
-                let (o, ck) = if bf { crate::fused::hebb_fwd_raw_b(&p, &cst, b, t, nh, NORM_EPS)? } else { hebb_fwd_raw(&p, &cst, b, t, nh, NORM_EPS)? };
+                let (o, ck) = if sg {
+                    crate::fused::hebb_fwd_raw_g(&p, &cst, b, t, nh, NORM_EPS, bf, true)?
+                } else if bf {
+                    crate::fused::hebb_fwd_raw_b(&p, &cst, b, t, nh, NORM_EPS)?
+                } else {
+                    hebb_fwd_raw(&p, &cst, b, t, nh, NORM_EPS)?
+                };
                 let wo = mm.op(&hb.wo.detach())?;
                 let x_m2 = x_m1.add(&mm.mm(&o, false, &wo, false)?)?;
-                (Mid::Hebb { h, p, cst, ck, o, wcat, wo }, x_m2)
+                (Mid::Hebb { h, p, cst, ck, o, wcat, wo, sg }, x_m2)
             } else {
                 let a = blk.attn.as_ref().expect("A block has attention or fast weights");
                 let wqkv = mm.op(&Tensor::cat(&[&a.wq.detach(), &a.wk.detach(), &a.wv.detach()], 1)?)?;
@@ -1599,12 +1951,18 @@ impl Model {
             if track {
                 act.kwta_post.push(mean_rows_first(&a_m.gt(0.0)?.to_dtype(DType::F32)?)?);
             }
-            saved.push(Saved { x_in: x, h1, cur, beta, s, x_m1, mid, eng, x_m2, h2, a_m, w });
+            if !fwd {
+                saved.push(Saved { x_in: x, h1, cur, beta, s, x_m1, mid, eng, x_m2, h2, a_m, w });
+            }
             x = x_out;
         }
         let gf = self.final_norm.detach();
         let hf = mm.rms(&x, &gf)?;
         let logits = mm.mm(&hf, false, &tok_b, true)?; // [N, V]
+        let Some(targets) = targets else {
+            return Ok(fwin::WinOut::Logits(logits)); // v52 fasteval: the forward stops here
+        };
+        let tg = targets.flatten_all()?;
         let ce = ce_fwd_raw(&logits, &tg)?; // [N, 2] = (loss, lse)
         let (loss, row_scale) = match wt {
             None => (ce.narrow(1, 0, 1)?.mean_all()?, Tensor::full((1.0 / n as f64) as f32, (n, 1), dev)?),
@@ -1653,8 +2011,8 @@ impl Model {
                     crate::fused::attn_bwd_tc(&es.qkv, &es.ob, &es.lse, &dout, b, t, scale)?
                 } else {
                     let dout = mm.mm(&dx_m, false, &es.wo, true)?;
-                    let dqkv = attn_bwd_s(&es.qkv, &es.o, &es.lse, &dout, b, t, scale)?;
-                    if bf { dqkv } else { dqkv.to_dtype(DType::F32)? }
+                    // v51 fast1 (F-1): the f32 step takes the f32 store (the bf16 one cost ~1e-3 of these gradients)
+                    if bf { attn_bwd_s(&es.qkv, &es.o, &es.lse, &dout, b, t, scale)? } else { crate::fused::attn_bwd_sf(&es.qkv, &es.o, &es.lse, &dout, b, t, scale)? }
                 };
                 let dw = mm.mm(&es.h, true, &dqkv, false)?;
                 grads.insert(&e.wq, dw.narrow(1, 0, d)?.contiguous()?);
@@ -1667,15 +2025,20 @@ impl Model {
             }
             // x_m2 = x_m1 + (fast weights or attention)(rms(x_m1))
             match &sv.mid {
-                Mid::Hebb { h, p, cst, ck, o, wcat, wo } => {
+                Mid::Hebb { h, p, cst, ck, o, wcat, wo, sg } => {
                     let hb = blk.hebb.as_ref().expect("fast-weight block");
                     let g = hb.gates.as_ref().expect("D has gates");
-                    let wg = hb.wg.as_ref().expect("D has an output gate");
                     grads.insert(&hb.wo, mm.mm(o, true, &dx_m, false)?);
                     let d_o = mm.mm(&dx_m, false, wo, true)?; // f32 [N, d]
                     // v40: under bf16 the kernels write dP's bf16 operand itself (the same bits as the cast) and its za,
                     // zb columns in f32 apart (dz [N, 2H]): the bias gradients read dz at column z0
-                    let (dp_b, dz, z0) = if bf {
+                    let (dp_b, dz, z0) = if *sg {
+                        // v44 K2: the sigmoid gate's kernels (dz f32 apart under bf16, as below)
+                        match crate::fused::hebb_bwd_raw_g(p, cst, ck, &d_o, b, t, nh, NORM_EPS, bf, true)? {
+                            (dp_b, Some(dz)) => (dp_b, dz, 0),
+                            (dp, None) => (dp.clone(), dp, 4 * d),
+                        }
+                    } else if bf {
                         let (dp_b, dz) = crate::fused::hebb_bwd_raw_b(p, cst, ck, &d_o, b, t, nh, NORM_EPS)?;
                         (dp_b, dz, 0)
                     } else {
@@ -1687,7 +2050,19 @@ impl Model {
                     grads.insert(&hb.wq, dw.narrow(1, 0, d)?.contiguous()?);
                     grads.insert(&hb.wk, dw.narrow(1, d, d)?.contiguous()?);
                     grads.insert(&hb.wv, dw.narrow(1, 2 * d, d)?.contiguous()?);
-                    grads.insert(wg, dw.narrow(1, 3 * d, d)?.contiguous()?);
+                    let dg = dw.narrow(1, 3 * d, d)?.contiguous()?;
+                    match (&hb.wg, &hb.wgl) {
+                        (Some(wg), _) => {
+                            grads.insert(wg, dg);
+                        }
+                        (None, Some((wd, wu))) => {
+                            // v44 K2: G = Wd·Wu, so dWd = dG·Wu^T and dWu = Wd^T·dG (f32)
+                            let dg = dg.to_dtype(DType::F32)?;
+                            grads.insert(wd, dg.matmul(&wu.detach().t()?)?);
+                            grads.insert(wu, wd.detach().t()?.matmul(&dg)?);
+                        }
+                        (None, None) => candle_core::bail!("D has an output gate"),
+                    }
                     grads.insert(&g.wa, dw.narrow(1, 4 * d, nh)?.contiguous()?);
                     grads.insert(&g.wb, dw.narrow(1, 4 * d + nh, nh)?.contiguous()?);
                     grads.insert(&g.ba, dz.narrow(1, z0, nh)?.sum(0)?);
@@ -1705,8 +2080,8 @@ impl Model {
                         crate::fused::attn_bwd_tc(qkv, ob, lse, &dout, b, t, scale)?
                     } else {
                         let dout = mm.mm(&dx_m, false, wo, true)?;
-                        let dqkv = attn_bwd_s(qkv, o, lse, &dout, b, t, scale)?; // bf16
-                        if bf { dqkv } else { dqkv.to_dtype(DType::F32)? }
+                        // v51 fast1 (F-1): the f32 step takes the f32 store
+                        if bf { attn_bwd_s(qkv, o, lse, &dout, b, t, scale)? } else { crate::fused::attn_bwd_sf(qkv, o, lse, &dout, b, t, scale)? }
                     };
                     let dw = mm.mm(h, true, &dqkv, false)?; // [d, 3d]
                     grads.insert(&a.wq, dw.narrow(1, 0, d)?.contiguous()?);
@@ -1742,7 +2117,84 @@ impl Model {
         }
         // embedding: x0 = tok[ids], so dtok[ids] += dx
         grads.insert(&self.tok, crate::fused::embed_bwd_add(&dtok_out, &idf, &dx)?);
-        Ok((loss, act, grads))
+        Ok(fwin::WinOut::Step(loss, act, grads))
+    }
+
+    /// v42: `loss_and_grads_a_wr` through candle's autograd (any device, any block options): the per-target losses
+    /// weighted as there (None: the mean over every target; `raw`: sum(w·loss); else sum(w·loss) / sum(w)).
+    pub fn loss_and_grads_autograd(&self, ids: &Tensor, targets: &Tensor, wt: Option<&Tensor>, raw: bool) -> Result<(Tensor, Activity, GradStore)> {
+        // v42 Wave 2C (O2): --mem-reset and --recall-loss act in this training forward only
+        self.train_fwd.set(true);
+        let fwd = self.forward_with_activity(ids);
+        self.train_fwd.set(false);
+        let (logits, act) = fwd?;
+        let tg = targets.flatten_all()?;
+        let n = tg.dim(0)?;
+        let rows = crate::lif::cross_entropy_rows(&logits, &tg)?; // [N]
+        let loss = match wt {
+            None => rows.mean_all()?,
+            Some(w) if raw => rows.mul(&w.reshape(n)?)?.sum_all()?,
+            Some(w) => {
+                let w = w.reshape(n)?;
+                rows.mul(&w)?.sum_all()?.broadcast_div(&w.sum_all()?)?
+            }
+        };
+        // F9 (--fok-qa): in an answer-only step the confidence probe learns only where the answer is scored
+        if let (Some(w), false, Some(ext)) = (wt, raw, self.ext.as_ref().filter(|_| self.cfg.arch.mem.fok_qa)) {
+            ext.mem.w5.stash.borrow_mut().scored = Some(w.reshape(n)?.gt(0.0)?.to_dtype(DType::F32)?);
+        }
+        // O2 --recall-loss W: the engram's own recall loss joins the gradient (the returned loss stays the main one);
+        // so do the auxiliary losses of src/wave5.rs, except in a signed reward step (`raw`), whose loss is no likelihood
+        let mut grads = match self.aux_terms(targets, !raw)? {
+            Some(r) => loss.add(&r)?.backward()?,
+            None => loss.backward()?,
+        };
+        // src/arch/ckpt.rs: the recomputed blocks' weight gradients
+        crate::arch::ckpt::merge(&mut grads)?;
+        // detached: a caller that keeps the loss for a later log line must not keep the step's whole graph with it
+        // (train_gpu and grow_gpu hold up to log-every losses; with the graph, a d128 run ran out of GPU memory at step 33)
+        Ok((loss.detach(), act, grads))
+    }
+
+    /// v42 Wave 2C (O2): W · the engram read's own cross-entropy from the last training forward, when --recall-loss
+    /// is on (the read is taken, so it is used once).
+    pub(crate) fn recall_term(&self, targets: &Tensor) -> Result<Option<Tensor>> {
+        let w = self.cfg.arch.mem.recall_loss as f64;
+        let Some(ext) = self.ext.as_ref().filter(|_| w > 0.0) else { return Ok(None) };
+        let Some(r) = ext.mem.recall.borrow_mut().take() else { return Ok(None) };
+        Ok(Some(crate::memory::recall_ce(&r, &self.final_norm, &self.tok, targets)?.affine(w, 0.0)?))
+    }
+
+    /// v42 Wave 2C/5: every auxiliary term of the last training forward: --recall-loss (O2) and, with `wave5`, the
+    /// auxiliary losses of src/wave5.rs (A7's KL, B1, N1, B2, C8/F9). What the forward kept for them is always taken.
+    pub(crate) fn aux_terms(&self, targets: &Tensor, wave5: bool) -> Result<Option<Tensor>> {
+        let rt = self.recall_term(targets)?;
+        let Some(ext) = self.ext.as_ref() else { return Ok(rt) };
+        let wt = crate::wave5::aux_loss(self, &ext.mem.w5, targets, wave5)?;
+        Ok(match (rt, wt) {
+            (Some(a), Some(b)) => Some(a.add(&b)?),
+            (a, b) => a.or(b),
+        })
+    }
+
+    /// v42 Wave 2C: the training loss with every auxiliary term of the block options, through autograd:
+    /// (total, next-token CE, activity). Total = CE + top_weight · order loss (R2, when the order head exists and
+    /// `top_weight` > 0) + recall-loss weight · engram CE (O2) + the auxiliary losses of src/wave5.rs. With none of
+    /// them it is `loss`.
+    pub fn loss_aux(&self, ids: &Tensor, targets: &Tensor, top_weight: f64) -> Result<(Tensor, Tensor, Activity)> {
+        self.train_fwd.set(true);
+        let r = if self.cfg.arch.top && top_weight > 0.0 {
+            self.loss_top(ids, targets, top_weight).map(|(total, ce, _, act)| (total, ce, act))
+        } else {
+            self.loss(ids, targets).map(|(ce, act)| (ce.clone(), ce, act))
+        };
+        self.train_fwd.set(false);
+        let (total, ce, act) = r?;
+        let total = match self.aux_terms(targets, true)? {
+            Some(rt) => total.add(&rt)?,
+            None => total,
+        };
+        Ok((total, ce, act))
     }
 
     pub fn loss(&self, ids: &Tensor, targets: &Tensor) -> Result<(Tensor, Activity)> {
@@ -1806,6 +2258,633 @@ impl Mm {
         } else {
             let s = a.add(b)?;
             Ok((s.clone(), s))
+        }
+    }
+}
+
+// ---------------------------------------------------------------- brain viewer (spike_record): per-neuron activity
+
+/// One block's per-neuron activity, recorded by `Model::forward_trace`. Rows are the B·T positions (batch-major).
+pub struct LayerTrace {
+    /// The LIF memory's spikes [N, d], exactly what reaches Wout: 0/1, or with block options (`--spikes ternary|int2`)
+    /// signed integers in {-L..L}.
+    pub spikes: Tensor,
+    /// The kWTA mask of the MLP's hidden layer [N, hidden], 0/1: the k winners (more only on an exact tie). With
+    /// block options and A7's pondering MLP (no mask of its own): the non-zero units of `hidden`.
+    pub winners: Tensor,
+    /// The MLP's hidden activity after kWTA and ReLU [N, hidden] (with `--mlp-act relu2` squared), exactly what
+    /// reaches W2 (what the winners pass on; 0 everywhere else).
+    pub hidden: Tensor,
+    /// The fast-weight memory's read [N, d], exactly as added to the residual stream (None without one).
+    pub hebb_read: Option<Tensor>,
+    /// G, R, D: the memory's write strength beta [N, heads] in (0, 2) and keep fraction alpha [N, heads] in (0, 1).
+    /// With block options: [N, heads · g], g = 1 per head or the head size per channel (`--gates channel|kda`; KDA's
+    /// write strength stays per head), head-major, the gates the memory used (after B8's modulators).
+    pub hebb_write: Option<Tensor>,
+    pub hebb_keep: Option<Tensor>,
+    /// The engram block only (and not lesioned): its attention weights [B, heads, T, T] (row i: how much token i
+    /// reads token j <= i) and its read [N, d], exactly as added to the residual stream. With block options the
+    /// weights are given for the plain read only (None under the Wave 2C engram options).
+    pub engram_attn: Option<Tensor>,
+    pub engram_read: Option<Tensor>,
+}
+
+/// Every block's activity of one forward pass (`Model::forward_trace`).
+pub struct Trace {
+    pub layers: Vec<LayerTrace>,
+    /// v49: the input's (B, T).
+    pub dims: (usize, usize),
+    /// v49: the magnitude code's features [N, MAG_F] as multiplied into mag_w (None without the code or lesioned).
+    pub mag: Option<Tensor>,
+}
+
+/// v49: one block's activity as `forward_arch` hands it to `forward_trace` (one piece per chunk of the window).
+#[derive(Default)]
+pub(crate) struct TracePiece {
+    pub(crate) spikes: Option<Tensor>,
+    pub(crate) winners: Option<Tensor>,
+    pub(crate) hidden: Option<Tensor>,
+    pub(crate) hebb_read: Option<Tensor>,
+    pub(crate) hebb_write: Option<Tensor>,
+    pub(crate) hebb_keep: Option<Tensor>,
+    pub(crate) engram_attn: Option<Tensor>,
+    pub(crate) engram_read: Option<Tensor>,
+}
+
+/// v49: `forward_trace`'s sink (`Model::trace_rec`): every block's pieces, and the block being run.
+pub(crate) struct TraceRec {
+    blocks: Vec<Vec<TracePiece>>,
+    cur: Option<usize>,
+}
+
+/// One trace field over a block's chunk pieces [b·tc, w] each, joined along time into [b·T, w] (batch-major).
+fn join_rows(parts: Vec<Tensor>, b: usize) -> Result<Tensor> {
+    if parts.len() == 1 {
+        return Ok(parts.into_iter().next().expect("one piece"));
+    }
+    let w = parts[0].dim(1)?;
+    let p3: Vec<Tensor> = parts.iter().map(|p| p.reshape((b, p.dim(0)? / b, w))).collect::<Result<_>>()?;
+    let j = Tensor::cat(&p3, 1)?;
+    let n = j.dim(1)? * b;
+    j.reshape((n, w))
+}
+
+/// Softmax attention weights [B, heads, T, T] of `attention` on h [B·T, d] (the same q, k, scale and mask).
+pub(crate) fn attn_weights(h: &Tensor, a: &Attn, b: usize, t: usize) -> Result<Tensor> {
+    let nh = h.dim(1)? / HEAD_SIZE;
+    let heads = |w: &Tensor| -> Result<Tensor> { crate::int8::mm(&h, w)?.reshape((b, t, nh, HEAD_SIZE))?.transpose(1, 2)?.contiguous() };
+    let (q, k) = (heads(&a.wq)?, heads(&a.wk)?);
+    let sc = q.matmul(&k.t()?.contiguous()?)?.affine(1.0 / (HEAD_SIZE as f64).sqrt(), 0.0)?;
+    candle_nn::ops::softmax(&sc.broadcast_add(&causal_mask(t, h.device())?)?, D::Minus1)?.detach().contiguous()
+}
+
+impl Model {
+    /// `forward` for the brain viewer (src/bin/spike_record.rs): the same ops in the same order as
+    /// `forward_with_activity`, so the same logits bit for bit (tests/smoke.rs checks it), plus every block's
+    /// per-neuron activity. The extras that the stream does not already hold (the memory's gates, the engram's
+    /// attention weights) are computed on the side from the same normed inputs and never feed back. Ava kinds only.
+    /// v49: a model with block options runs `forward` itself (`forward_with_activity` → `forward_arch`, the one code
+    /// path) with the trace sink on: its blocks hand over what they computed, so the logits are forward's by
+    /// construction (src/synops/arch_tests.rs checks them bit for bit).
+    pub fn forward_trace(&self, ids: &Tensor) -> Result<(Tensor, Trace)> {
+        if !self.cfg.kind.is_ava() {
+            candle_core::bail!("forward_trace: only Ava's kinds have spikes (not T)");
+        }
+        if self.arch_path() {
+            return self.forward_trace_arch(ids);
+        }
+        let _q8 = self.int8_scope();
+        let (b, t) = ids.dims2()?;
+        let d = self.cfg.d;
+        let n = b * t;
+        let fast = crate::fast_path() && ids.device().is_cuda();
+        let mut x = if fast { crate::fused::embedding(&self.tok, ids)? } else { self.tok.embedding(&ids.flatten_all()?)? }; // [N, d]
+        let (place_off, mag_off, eng_off) = self.lesion.get();
+        if let (Some(place), false) = (&self.place, place_off) {
+            let pid = crate::fused::place_ids(ids)?;
+            x = x.add(&Self::place_table(place)?.embedding(&pid)?)?;
+        }
+        let mut mag = None;
+        if let (Some(mw), false) = (&self.mag_w, mag_off) {
+            let mf = crate::fused::mag_feats(ids)?;
+            x = x.add(&mf.matmul(mw)?)?;
+            mag = Some(mf);
+        }
+        let mask = if matches!(self.cfg.kind, Kind::A) { Some(causal_mask(t, x.device())?) } else { None };
+        let decay = match self.cfg.kind {
+            Kind::F => Some(hebb_decay(self.cfg.heads(), t, x.device())?),
+            Kind::G | Kind::R => Some(causal_mask(t, x.device())?),
+            Kind::D | Kind::A => Some(Tensor::zeros(1, DType::F32, x.device())?),
+            _ => None,
+        };
+        let mut layers = Vec::with_capacity(self.blocks.len());
+        for blk in &self.blocks {
+            let m = blk.mem.as_ref().expect("Ava block has SpikeMem");
+            let h = norm(&x, &m.norm)?;
+            let cur = crate::int8::mm(&h, &m.win)?.reshape((b, t, d))?;
+            let s = lif_scan(&cur, &m.beta)?;
+            let spikes = s.detach().reshape((n, d))?;
+            x = x.add(&crate::int8::mm(&s.reshape((n, d))?, &m.wout)?)?;
+            let (mut hebb_read, mut hebb_write, mut hebb_keep) = (None, None, None);
+            if let (Some(hb), Some(decay)) = (&blk.hebb, &decay) {
+                let h = norm(&x, &hb.norm)?;
+                let r = if self.infer.get() && hb.delta && h.device().is_cuda() && HEAD_SIZE == crate::fused::ATTN_HS {
+                    hebb_infer(&h, hb, b, t)?
+                } else {
+                    hebb(&h, hb, b, t, decay)?
+                };
+                if let Some(g) = &hb.gates {
+                    let (la, beta) = hebb_gates(&h, g)?;
+                    hebb_keep = Some(la.exp()?.detach());
+                    hebb_write = Some(beta.detach());
+                }
+                x = x.add(&r)?;
+                hebb_read = Some(r.detach());
+            }
+            if let (Some(a), Some(mask)) = (&blk.attn, &mask) {
+                let h = norm(&x, &a.norm)?;
+                x = x.add(&attention(&h, a, b, t, mask)?)?;
+            }
+            let (mut engram_attn, mut engram_read) = (None, None);
+            if let (Some(e), false) = (&blk.eng, eng_off) {
+                let h = norm(&x, &e.norm)?;
+                let r = self.engram_read(&h, e, b, t)?;
+                engram_attn = Some(attn_weights(&h, e, b, t)?);
+                x = x.add(&r)?;
+                engram_read = Some(r.detach());
+            }
+            let l = &blk.mlp;
+            let h = norm(&x, &l.norm)?;
+            let u = crate::int8::mm(&h, &l.w1)?;
+            let winners = kwta_mask(&u, self.cfg.kwta_k())?;
+            let a = if crate::fast_path() && u.device().is_cuda() { crate::fused::kwta_relu(&u, self.cfg.kwta_k())? } else { u.mul(&winners)?.relu()? };
+            x = x.add(&crate::int8::mm(&a, &l.w2)?)?;
+            layers.push(LayerTrace { spikes, winners, hidden: a.detach(), hebb_read, hebb_write, hebb_keep, engram_attn, engram_read });
+        }
+        let x = norm(&x, &self.final_norm)?;
+        let logits = crate::int8::head(&x, &self.tok)?;
+        Ok((logits, Trace { layers, dims: (b, t), mag }))
+    }
+
+    /// v49: `forward_trace` for a model with block options: `forward_with_activity` (what `forward` runs) with the
+    /// trace sink on, the sink switched off again whatever happens.
+    fn forward_trace_arch(&self, ids: &Tensor) -> Result<(Tensor, Trace)> {
+        let (b, t) = ids.dims2()?;
+        let nb = self.blocks.len();
+        *self.trace_rec.borrow_mut() = Some(TraceRec { blocks: (0..nb).map(|_| Vec::new()).collect(), cur: None });
+        let r = self.forward_with_activity(ids);
+        let rec = self.trace_rec.borrow_mut().take();
+        let (logits, _) = r?;
+        let rec = rec.ok_or_else(|| candle_core::Error::Msg("forward_trace: the trace sink was taken".into()))?;
+        let mut layers = Vec::with_capacity(nb);
+        for (i, pieces) in rec.blocks.into_iter().enumerate() {
+            if pieces.is_empty() {
+                candle_core::bail!("forward_trace: block {i} recorded nothing");
+            }
+            let one = pieces.len() == 1;
+            let mut f: [Vec<Tensor>; 7] = Default::default();
+            let mut attn = Vec::new();
+            for p in pieces {
+                for (k, x) in [p.spikes, p.winners, p.hidden, p.hebb_read, p.hebb_write, p.hebb_keep, p.engram_read].into_iter().enumerate() {
+                    if let Some(x) = x {
+                        f[k].push(x);
+                    }
+                }
+                attn.extend(p.engram_attn);
+            }
+            let need = |v: Vec<Tensor>, what: &str| -> Result<Tensor> {
+                if v.is_empty() {
+                    candle_core::bail!("forward_trace: block {i} recorded no {what}");
+                }
+                join_rows(v, b)
+            };
+            let opt = |v: Vec<Tensor>| -> Result<Option<Tensor>> { if v.is_empty() { Ok(None) } else { join_rows(v, b).map(Some) } };
+            let [s, w, h, hr, hw, hk, er] = f;
+            layers.push(LayerTrace {
+                spikes: need(s, "spikes")?,
+                winners: need(w, "kWTA winners")?,
+                hidden: need(h, "MLP units")?,
+                hebb_read: opt(hr)?,
+                hebb_write: opt(hw)?,
+                hebb_keep: opt(hk)?,
+                // [B, heads, T, T] per window; a window run in chunks (O1, which has no engram) has none
+                engram_attn: if one { attn.pop() } else { None },
+                engram_read: opt(er)?,
+            });
+        }
+        let mag = match (&self.mag_w, self.lesion.get().1) {
+            (Some(_), false) => Some(crate::fused::mag_feats(ids)?), // the same features forward_arch adds (from ids)
+            _ => None,
+        };
+        Ok((logits, Trace { layers, dims: (b, t), mag }))
+    }
+
+    /// v49: whether a `forward_trace` sink is open (the blocks of `forward_arch` then hand over their activity).
+    pub(crate) fn tracing(&self) -> bool {
+        self.trace_rec.borrow().is_some()
+    }
+
+    /// v49: block `i` starts (one new piece per chunk of the window); later `trace_put`s go to it.
+    pub(crate) fn trace_begin(&self, i: usize) {
+        if let Some(r) = self.trace_rec.borrow_mut().as_mut() {
+            if let Some(v) = r.blocks.get_mut(i) {
+                v.push(TracePiece::default());
+                r.cur = Some(i);
+            }
+        }
+    }
+
+    /// v49: set fields of the running block's piece (nothing without a sink or before a block started).
+    pub(crate) fn trace_put(&self, f: impl FnOnce(&mut TracePiece)) {
+        if let Some(r) = self.trace_rec.borrow_mut().as_mut() {
+            if let Some(p) = r.cur.and_then(|i| r.blocks.get_mut(i)).and_then(|v| v.last_mut()) {
+                f(p);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- live brain viewer (ava_live): one token's activity
+
+/// One block's activity for one token, recorded by `Model::step_trace`.
+pub struct StepLayer {
+    /// The LIF memory's spikes [1, d], 0/1.
+    pub spikes: Tensor,
+    /// The kWTA mask of the MLP's hidden layer [1, 4d], 0/1 (the k winners), and its activity after ReLU [1, 4d].
+    pub winners: Tensor,
+    pub hidden: Tensor,
+    /// The fast-weight memory, per head [heads]: write = |F_new - keep*F_old| (Frobenius; for D the size of the
+    /// corrected error it stored, beta*|v - alpha*k^T F|), read = |q*F_new| (before the head norm), and the gates:
+    /// keep (alpha, or F's fixed gamma) and, for gated kinds, the write gate beta. None in blocks without the memory.
+    pub mem_write: Option<Tensor>,
+    pub mem_read: Option<Tensor>,
+    pub mem_keep: Option<Tensor>,
+    pub mem_gate: Option<Tensor>,
+    /// The engram block (not lesioned): its attention [heads, seen] over every token so far (this one last), and
+    /// its read [1, d] exactly as added to the stream.
+    pub engram_attn: Option<Tensor>,
+    pub engram_read: Option<Tensor>,
+}
+
+/// One token's activity (`Model::step_trace`).
+pub struct StepTrace {
+    pub layers: Vec<StepLayer>,
+    /// The glance's place code of this token (0 = units, 1 = tens, ...; 16 = none) and, with the magnitude code
+    /// (not lesioned), the position on the log line it added (None = it added nothing).
+    pub place: u32,
+    pub mag: Option<f64>,
+    /// v49 (the chat app): the RMS of what entered her stream for this token, before block 0 (the token's embedding
+    /// plus the glance's place row and the magnitude code's features, when they add anything).
+    pub input_rms: f32,
+    /// v51 (src/v51.rs): the "mood signal", the last surprise and the rhythms' phases (None without those parts)
+    pub v51: Option<crate::v51::V51Trace>,
+}
+
+impl Stream {
+    /// Every tensor of the carried state, in a fixed order (for tests that compare two streams exactly).
+    pub fn state_tensors(&self) -> Vec<Tensor> {
+        let mut v: Vec<Tensor> = self.v.iter().chain(&self.s).chain(&self.fw).cloned().collect();
+        for (k, val) in self.kv.iter().flatten().chain(self.ekv.iter()) {
+            v.push(k.clone());
+            v.push(val.clone());
+        }
+        v
+    }
+
+    /// The scalar part of the carried state: (seen, place_len, place_idx, the last tokens).
+    pub fn state_scalars(&self) -> (usize, u32, u32, Vec<u32>) {
+        (self.seen, self.place_len, self.place_idx, self.hist.clone())
+    }
+}
+
+impl Model {
+    /// `step` for the live viewer (src/bin/ava_live.rs): the same ops in the same order, so the same logits and the
+    /// same carried state bit for bit (tests/smoke.rs checks both), plus this token's activity in every block. The
+    /// extras (norms, gates, attention weights) are computed on the side and never feed back.
+    pub fn step_trace(&self, st: &mut Stream, tok: u32) -> Result<(Tensor, StepTrace)> {
+        let _q8 = self.int8_scope();
+        let dev = self.tok.device();
+        if st.st.is_some() {
+            // v49: a State-backed stream (block options), traced on the step `step` runs
+            return self.step_trace_state(st, tok);
+        }
+        let mut x = self.tok.embedding(&Tensor::new(&[tok], dev)?)?; // [1, d]
+        let (place_off, mag_off, eng_off) = self.lesion.get();
+        let p = st.next_place(tok) as usize;
+        if let (Some(place), false) = (&self.place, place_off) {
+            x = x.add(&Self::place_table(place)?.narrow(0, p, 1)?)?;
+        }
+        st.hist.push(tok);
+        if st.hist.len() > 17 {
+            st.hist.remove(0);
+        }
+        let mut mag = None;
+        if let (Some(mw), false) = (&self.mag_w, mag_off) {
+            if let Some(m) = crate::mag::position(&st.hist, st.hist.len() - 1) {
+                let f = Tensor::from_vec(crate::mag::code(m).to_vec(), (1, crate::mag::MAG_F), dev)?;
+                x = x.add(&f.matmul(mw)?)?;
+                mag = Some(m);
+            }
+        }
+        // v49: on the side, the size of what entered her stream (the viewer's input side)
+        let input_rms = x.sqr()?.mean_all()?.sqrt()?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+        let mut layers = Vec::with_capacity(self.blocks.len());
+        for (i, blk) in self.blocks.iter().enumerate() {
+            let m = blk.mem.as_ref().expect("S block has SpikeMem");
+            let h = rmsnorm(&x, &m.norm)?;
+            let cur = crate::int8::mm(&h, &m.win)?;
+            let v = st.v[i].mul(&st.beta[i])?.add(&cur)?.sub(&st.s[i].affine(LIF_THRESHOLD, 0.0)?)?;
+            let s = v.affine(1.0, -LIF_THRESHOLD)?.ge(0.0)?.to_dtype(DType::F32)?;
+            x = x.add(&crate::int8::mm(&s, &m.wout)?)?;
+            st.v[i] = v;
+            st.s[i] = s.clone();
+            let (mut mem_write, mut mem_read, mut mem_keep, mut mem_gate) = (None, None, None, None);
+            if let Some(hb) = &blk.hebb {
+                let nh = self.cfg.heads();
+                let h = rmsnorm(&x, &hb.norm)?;
+                let (mut q, mut k) = (crate::int8::mm(&h, &hb.wq)?.reshape((nh, 1, HEAD_SIZE))?, crate::int8::mm(&h, &hb.wk)?.reshape((nh, 1, HEAD_SIZE))?);
+                if hb.qk_norm {
+                    q = l2_norm(&q)?;
+                    k = l2_norm(&k)?;
+                }
+                let k_row = k.clone();
+                let k = k.reshape((nh, HEAD_SIZE, 1))?;
+                let v = crate::int8::mm(&h, &hb.wv)?.reshape((nh, 1, HEAD_SIZE))?;
+                let imprint = k.matmul(&v)?;
+                let f_old = st.fw[i].clone();
+                let fw = match (&hb.gates, &st.gamma) {
+                    (Some(g), _) if hb.delta => {
+                        let (la, beta) = hebb_gates(&h, g)?;
+                        let (alpha, beta) = (la.exp()?.reshape((nh, 1, 1))?, beta.reshape((nh, 1, 1))?);
+                        let pred = k_row.matmul(&st.fw[i])?;
+                        let corr = k.matmul(&pred)?.broadcast_mul(&beta)?;
+                        st.fw[i].sub(&corr)?.broadcast_mul(&alpha)?.add(&imprint.broadcast_mul(&beta)?)?
+                    }
+                    (Some(g), _) => {
+                        let (la, beta) = hebb_gates(&h, g)?;
+                        let alpha = la.exp()?.reshape((nh, 1, 1))?;
+                        st.fw[i].broadcast_mul(&alpha)?.add(&imprint.broadcast_mul(&beta.reshape((nh, 1, 1))?)?)?
+                    }
+                    (None, Some(gamma)) => st.fw[i].broadcast_mul(gamma)?.add(&imprint)?,
+                    (None, None) => candle_core::bail!("step: fast weights without forgetting rates"),
+                };
+                let read = q.matmul(&fw)?;
+                let y = head_norm(&if hb.delta { read.clone() } else { read.affine(1.0 / (HEAD_SIZE as f64).sqrt(), 0.0)? })?;
+                x = x.add(&crate::int8::mm(&out_gate(&y.reshape((1, self.cfg.d))?, &h, hb)?, &hb.wo)?)?;
+                st.fw[i] = fw.clone();
+                // on the side: the gates again (the same values), the size of the write and of the read
+                let keep = match (&hb.gates, &st.gamma) {
+                    (Some(g), _) => {
+                        let (la, beta) = hebb_gates(&h, g)?;
+                        mem_gate = Some(beta.reshape(nh)?);
+                        la.exp()?.reshape((nh, 1, 1))?
+                    }
+                    (None, Some(gamma)) => gamma.clone(),
+                    (None, None) => candle_core::bail!("step: fast weights without forgetting rates"),
+                };
+                let norm3 = |t: &Tensor| -> Result<Tensor> { t.sqr()?.sum_keepdim(2)?.sum_keepdim(1)?.sqrt()?.reshape(nh) };
+                mem_write = Some(norm3(&fw.sub(&f_old.broadcast_mul(&keep)?)?)?);
+                mem_read = Some(norm3(&read)?);
+                mem_keep = Some(keep.reshape(nh)?);
+            }
+            if let Some(a) = &blk.attn {
+                let nh = self.cfg.heads();
+                let h = rmsnorm(&x, &a.norm)?;
+                let head = |w: &Tensor| -> Result<Tensor> { crate::int8::mm(&h, w)?.reshape((nh, 1, HEAD_SIZE)) };
+                let (q, k, v) = (head(&a.wq)?, head(&a.wk)?, head(&a.wv)?);
+                let (kc, vc) = match st.kv[i].take() {
+                    None => (k, v),
+                    Some((kp, vp)) => (Tensor::cat(&[&kp, &k], 1)?, Tensor::cat(&[&vp, &v], 1)?),
+                };
+                let sc = q.matmul(&kc.t()?.contiguous()?)?.affine(1.0 / (HEAD_SIZE as f64).sqrt(), 0.0)?;
+                let o = candle_nn::ops::softmax(&sc, D::Minus1)?.matmul(&vc)?;
+                x = x.add(&crate::int8::mm(&o.reshape((1, self.cfg.d))?, &a.wo)?)?;
+                st.kv[i] = Some((kc, vc));
+            }
+            let (mut engram_attn, mut engram_read) = (None, None);
+            if let Some(e) = &blk.eng {
+                let nh = self.cfg.heads();
+                let h = rmsnorm(&x, &e.norm)?;
+                let head = |w: &Tensor| -> Result<Tensor> { crate::int8::mm(&h, w)?.reshape((nh, 1, HEAD_SIZE)) };
+                let (q, k, v) = (head(&e.wq)?, head(&e.wk)?, head(&e.wv)?);
+                let (kc, vc) = match st.ekv.take() {
+                    None => (k, v),
+                    Some((kp, vp)) => (Tensor::cat(&[&kp, &k], 1)?, Tensor::cat(&[&vp, &v], 1)?),
+                };
+                if !eng_off {
+                    let sc = q.matmul(&kc.t()?.contiguous()?)?.affine(1.0 / (HEAD_SIZE as f64).sqrt(), 0.0)?;
+                    let att = candle_nn::ops::softmax(&sc, D::Minus1)?;
+                    let o = att.matmul(&vc)?;
+                    let r = crate::int8::mm(&o.reshape((1, self.cfg.d))?, &e.wo)?;
+                    x = x.add(&r)?;
+                    engram_attn = Some(att.squeeze(1)?);
+                    engram_read = Some(r);
+                }
+                st.ekv = Some((kc, vc));
+            }
+            let l = &blk.mlp;
+            let h = rmsnorm(&x, &l.norm)?;
+            let u = crate::int8::mm(&h, &l.w1)?;
+            let winners = kwta_mask(&u, self.cfg.kwta_k())?;
+            let a = u.mul(&winners)?.relu()?;
+            x = x.add(&crate::int8::mm(&a, &l.w2)?)?;
+            layers.push(StepLayer { spikes: s, winners, hidden: a, mem_write, mem_read, mem_keep, mem_gate, engram_attn, engram_read });
+        }
+        st.seen += 1;
+        let x = rmsnorm(&x, &self.final_norm)?;
+        Ok((crate::int8::head(&x, &self.tok)?.squeeze(0)?, StepTrace { layers, place: p as u32, mag, input_rms, v51: None }))
+    }
+
+    /// v49 (the chat app): `step_trace` on a State-backed stream (block options). With `set_fused` on and where it
+    /// applies, the fused step (src/model/fstep/arch.rs) runs with its record on: copies of what it computed (spikes,
+    /// kWTA winners and units, the memory's gates, the size of its write and of each head's read, the engram's
+    /// attention and read). Else the plain State step (`forward_with_state` of one token, what `step` runs) with
+    /// forward_trace's sink open: its blocks hand over their spikes, units, the memory's gates and the engram's read;
+    /// the write size comes from the State before and after; the read size and the engram's weights are not given
+    /// there. Either way the logits and the State are `step`'s bit for bit (src/model/fstep/trace_tests.rs).
+    fn step_trace_state(&self, st: &mut Stream, tok: u32) -> Result<(Tensor, StepTrace)> {
+        let _q8 = self.int8_scope();
+        let dev = self.tok.device().clone();
+        let s = st.st.as_mut().expect("a State-backed stream");
+        let t1 = |v: Vec<f32>| -> Result<Tensor> {
+            let n = v.len();
+            Tensor::from_vec(v, (1, n), &dev)
+        };
+        let t0 = |v: Vec<f32>| -> Result<Option<Tensor>> {
+            if v.is_empty() {
+                return Ok(None);
+            }
+            let n = v.len();
+            Tensor::from_vec(v, n, &dev).map(Some)
+        };
+        if self.fused.get() {
+            let mut rec = fstep::arch::TokTrace::default();
+            if let Some(l) = fstep::arch::step_traced(self, s, tok, &mut rec)? {
+                st.seen += 1;
+                let mut layers = Vec::with_capacity(rec.layers.len());
+                for ly in rec.layers {
+                    let engram = match ly.engram {
+                        Some((w, n, r)) => {
+                            let nh = w.len() / n.max(1);
+                            (Some(Tensor::from_vec(w, (nh, n), &dev)?), Some(t1(r)?))
+                        }
+                        None => (None, None),
+                    };
+                    layers.push(StepLayer {
+                        spikes: t1(ly.spikes)?,
+                        winners: t1(ly.winners)?,
+                        hidden: t1(ly.hidden)?,
+                        mem_write: t0(ly.mem_write)?,
+                        mem_read: t0(ly.mem_read)?,
+                        mem_keep: t0(ly.mem_keep)?,
+                        mem_gate: t0(ly.mem_gate)?,
+                        engram_attn: engram.0,
+                        engram_read: engram.1,
+                    });
+                }
+                return Ok((l, StepTrace { layers, place: rec.place, mag: rec.mag, input_rms: rec.input_rms, v51: crate::v51::trace(self, &s.v51)? })); // v51 fast3: the mood signal, from the State as the plain step reads it
+            }
+        }
+        // the plain State step with the sink open; the input as forward_with_state forms it (for the viewer only)
+        let full: Vec<u32> = s.hist[0].iter().copied().chain(std::iter::once(tok)).collect();
+        let h0 = full.len() - 1;
+        let (place_off, mag_off, _) = self.lesion.get();
+        let place = match (&self.place, place_off) {
+            (Some(_), false) => ava_data::numbers::place_ids(&full)[h0].min(PLACES as u32),
+            _ => PLACES as u32,
+        };
+        let mag = match (&self.mag_w, mag_off) {
+            (Some(_), false) => crate::mag::position(&full, h0),
+            _ => None,
+        };
+        let input_rms = {
+            let mut x = self.tok.embedding(&Tensor::new(&[tok], &dev)?)?;
+            if let (Some(pt), false) = (&self.place, place_off) {
+                if (place as usize) < PLACES {
+                    x = x.add(&Self::place_table(pt)?.narrow(0, place as usize, 1)?)?;
+                }
+            }
+            if let (Some(mw), false) = (&self.mag_w, mag_off) {
+                let fe = crate::mag::feats_row(&full)[h0 * crate::mag::MAG_F..(h0 + 1) * crate::mag::MAG_F].to_vec();
+                x = x.add(&Tensor::from_vec(fe, (1, crate::mag::MAG_F), &dev)?.matmul(mw)?)?;
+            }
+            x.sqr()?.mean_all()?.sqrt()?.to_scalar::<f32>()?
+        };
+        let f_old: Vec<Option<Vec<f32>>> = s.mem.iter().map(|m| m.as_ref().map(|m| m.f.flatten_all()?.to_vec1::<f32>()).transpose()).collect::<Result<_>>()?;
+        let nb = self.blocks.len();
+        *self.trace_rec.borrow_mut() = Some(TraceRec { blocks: (0..nb).map(|_| Vec::new()).collect(), cur: None });
+        let r = self.forward_with_state(&Tensor::new(&[[tok]], &dev)?, s);
+        let rec = self.trace_rec.borrow_mut().take();
+        let logits = r?.squeeze(0)?;
+        st.seen += 1;
+        let rec = rec.ok_or_else(|| candle_core::Error::Msg("step_trace: the trace sink was taken".into()))?;
+        let s = st.st.as_ref().expect("a State-backed stream");
+        let mut layers = Vec::with_capacity(nb);
+        for (i, mut pieces) in rec.blocks.into_iter().enumerate() {
+            let p = pieces.pop().unwrap_or_default();
+            let d = self.cfg.d;
+            let spikes = p.spikes.map(|x| x.reshape((1, d))).transpose()?.unwrap_or(Tensor::zeros((1, d), DType::F32, &dev)?);
+            let hidden = p.hidden.map(|x| x.reshape((1, ()))).transpose()?.unwrap_or(Tensor::zeros((1, self.cfg.hidden()), DType::F32, &dev)?);
+            let winners = match p.winners {
+                Some(w) => w.reshape((1, ()))?,
+                None => hidden.ne(0f32)?.to_dtype(DType::F32)?,
+            };
+            // the memory: its gates per head (means over a head's channels), and the size of its write from the State
+            let (mut mem_write, mut mem_keep, mut mem_gate) = (None, None, None);
+            if let (Some(keep), Some(gate)) = (&p.hebb_keep, &p.hebb_write) {
+                let kv: Vec<f32> = keep.flatten_all()?.to_vec1()?;
+                let gv: Vec<f32> = gate.flatten_all()?.to_vec1()?;
+                let fo = f_old.get(i).cloned().flatten();
+                let fnew: Option<Vec<f32>> = s.mem.get(i).and_then(|m| m.as_ref()).map(|m| m.f.flatten_all()?.to_vec1::<f32>()).transpose()?;
+                if let (Some(fo), Some(fnew)) = (fo, fnew) {
+                    let len = fo.len();
+                    // F is [heads, hs, hs]: hs from its size, the gates per head (g = 1) or per channel (g = hs)
+                    let hs = len / d;
+                    let nh = if hs > 0 && d % hs == 0 && d * hs == len { d / hs } else { 0 };
+                    if nh > 0 && fnew.len() == len && kv.len() % nh == 0 && kv.len() == gv.len() {
+                        let g = kv.len() / nh;
+                        let keep_of = |e: usize, a: usize| if g == 1 { kv[e] } else { kv[e * g + a.min(g - 1)] };
+                        let w: Vec<f32> = (0..nh)
+                            .map(|e| {
+                                let mut s2 = 0f32;
+                                for a in 0..hs {
+                                    let xa = keep_of(e, a);
+                                    for b in 0..hs {
+                                        let j = e * hs * hs + a * hs + b;
+                                        let dl = fnew[j] - fo[j] * xa;
+                                        s2 += dl * dl;
+                                    }
+                                }
+                                s2.sqrt()
+                            })
+                            .collect();
+                        mem_write = Some(Tensor::from_vec(w, nh, &dev)?);
+                        let per_head = |v: &[f32]| -> Vec<f32> { (0..nh).map(|e| v[e * g..(e + 1) * g].iter().sum::<f32>() / g as f32).collect() };
+                        mem_keep = Some(Tensor::from_vec(per_head(&kv), nh, &dev)?);
+                        mem_gate = Some(Tensor::from_vec(per_head(&gv), nh, &dev)?);
+                    }
+                }
+            }
+            let engram_read = p.engram_read.map(|r| r.reshape((1, d))).transpose()?;
+            layers.push(StepLayer { spikes, winners, hidden, mem_write, mem_read: None, mem_keep, mem_gate, engram_attn: None, engram_read });
+        }
+        Ok((logits, StepTrace { layers, place, mag, input_rms, v51: crate::v51::trace(self, &s.v51)? }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_nn::{VarBuilder, VarMap};
+
+    /// The 2-D parameters of a small model of `kind` built on the CPU: (name, elements).
+    fn matrices(kind: Kind) -> Vec<(String, usize)> {
+        let cfg = Config::with_kind(kind, 64, 64, 4, 16);
+        let varmap = VarMap::new();
+        Model::new(cfg, VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu)).unwrap();
+        let mut out: Vec<(String, usize)> =
+            varmap.data().lock().unwrap().iter().filter(|(_, v)| v.as_tensor().rank() == 2).map(|(k, v)| (k.clone(), v.elem_count())).collect();
+        out.sort();
+        out
+    }
+
+    /// W1: which 2-D parameters decay, with and without --decay-gates, for D, A and T. Embedding-like tables and the
+    /// small gate projections .wa/.wb never decay; the output gate .wg decays only with the flag; every other
+    /// matrix always decays; no 1-D parameter decays.
+    #[test]
+    fn decay_sets_of_d_a_and_t() {
+        let never = |n: &str| [TOK_EMB, POS_EMB, PLACE_EMB, MAG_W].contains(&n) || n.ends_with(".wa") || n.ends_with(".wb");
+        for kind in [Kind::D, Kind::A, Kind::T] {
+            let mats = matrices(kind);
+            assert!(!mats.is_empty());
+            let gates: Vec<&String> = mats.iter().map(|m| &m.0).filter(|n| n.ends_with(".wg")).collect();
+            // D: an output gate in every block; A: in every block but its attention blocks; T: none
+            match kind {
+                Kind::D => assert_eq!(gates.len(), 4),
+                Kind::A => assert!(!gates.is_empty() && gates.len() < 4),
+                _ => assert!(gates.is_empty()),
+            }
+            for (n, _) in &mats {
+                let gate = n.ends_with(".wg");
+                assert_eq!(Model::decays_with(n, false), !never(n) && !gate, "{kind:?} {n} without the flag");
+                assert_eq!(Model::decays_with(n, true), !never(n), "{kind:?} {n} with the flag");
+                assert_eq!(Model::decays(n), Model::decays_with(n, false), "{kind:?} {n}: the old rule is unchanged");
+            }
+            if kind == Kind::D {
+                // the output gate is a real share of the weights (the 6.6% found at Ava-B's shape)
+                let all: usize = mats.iter().map(|m| m.1).sum();
+                let wg: usize = mats.iter().filter(|m| m.0.ends_with(".wg")).map(|m| m.1).sum();
+                assert!(wg * 30 > all, "wg {wg} of {all}");
+            }
+        }
+        // 1-D parameters (norm gains, LIF betas, gate biases) never decay
+        let cfg = Config::with_kind(Kind::D, 64, 64, 2, 16);
+        let varmap = VarMap::new();
+        Model::new(cfg, VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu)).unwrap();
+        for (n, v) in varmap.data().lock().unwrap().iter() {
+            if v.as_tensor().rank() == 1 {
+                assert!(!Model::decays_with(n, true), "{n} is 1-D");
+            }
         }
     }
 }

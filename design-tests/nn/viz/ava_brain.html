@@ -1,0 +1,604 @@
+<!-- TESTING / DESIGN ONLY — Ava's brain viewer: her real recorded spikes (spike_record JSON) as a rotating golden sphere. No libraries, no network. -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ava Brain Viewer</title>
+<style>
+  :root {
+    --bg: #000;
+    --gold: #e9c46a;
+    --gold-hi: #ffe9b0;
+    --gold-dim: #8a6a35;
+    --gold-faint: rgba(233, 196, 106, 0.18);
+    --ink: #d8c7a3;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, "SF Mono", Menlo, monospace;
+    --sans: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); font-family: var(--sans); overflow: hidden; }
+  #stage { position: fixed; inset: 0; cursor: grab; touch-action: none; }
+  #stage.drag { cursor: grabbing; }
+  #stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .vignette { position: fixed; inset: 0; pointer-events: none; background: radial-gradient(ellipse at 50% 42%, rgba(0,0,0,0) 55%, rgba(0,0,0,0.55) 100%); }
+  .ui { position: fixed; pointer-events: none; }
+  .ui * { pointer-events: auto; }
+  #title { top: 22px; left: 28px; }
+  #title .brand { font-size: 30px; letter-spacing: 0.55em; font-weight: 300; color: var(--gold-hi); text-shadow: 0 0 18px rgba(255, 200, 100, 0.45); }
+  #title .sub { margin-top: 6px; font-size: 11px; letter-spacing: 0.28em; text-transform: uppercase; color: var(--gold-dim); }
+  #title .meta { margin-top: 10px; font: 11px/1.6 var(--mono); color: #9c8358; }
+  #readout { top: 22px; right: 24px; width: 250px; font: 11px/1.5 var(--mono); color: #b49a6a; }
+  #readout h4 { margin: 0 0 6px; font: 10px var(--sans); letter-spacing: 0.25em; text-transform: uppercase; color: var(--gold-dim); font-weight: 600; }
+  .lrow { display: grid; grid-template-columns: 26px 1fr 34px 1fr; gap: 6px; align-items: center; height: 17px; cursor: pointer; }
+  .lrow.off { opacity: 0.3; }
+  .lrow .bar { height: 5px; background: rgba(233, 196, 106, 0.1); position: relative; border-radius: 3px; overflow: hidden; }
+  .lrow .bar i { position: absolute; left: 0; top: 0; bottom: 0; background: linear-gradient(90deg, #a8742a, #ffd27a); border-radius: 3px; transition: width 0.12s; }
+  .lrow .bar.mem i { background: linear-gradient(90deg, #6d5530, #f6e3b4); }
+  .lrow .num { text-align: right; color: var(--gold); }
+  .lrow .eng { color: var(--gold-hi); }
+  #engram { margin-top: 12px; min-height: 52px; }
+  #engram .rec { display: flex; gap: 8px; align-items: baseline; }
+  #engram .rec b { font-weight: 400; color: var(--gold-hi); white-space: pre; }
+  #legend { left: 28px; top: 50%; transform: translateY(-50%); font: 11px/1.9 var(--sans); color: #a48a5c; letter-spacing: 0.04em; }
+  #legend div { display: flex; align-items: center; gap: 10px; }
+  #legend .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+  #bottom { left: 0; right: 0; bottom: 64px; display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 0 16px; }
+  #sentence { max-width: min(1100px, 94vw); text-align: center; font-size: clamp(17px, 2.1vw, 26px); font-weight: 300; line-height: 1.5; letter-spacing: 0.01em; }
+  #sentence span { white-space: pre-wrap; color: rgba(216, 199, 163, 0.25); transition: color 0.25s, text-shadow 0.25s; cursor: pointer; }
+  #sentence span.past { color: rgba(233, 205, 150, 0.78); }
+  #sentence span.cur { color: #fff3d6; text-shadow: 0 0 14px rgba(255, 196, 90, 0.95), 0 0 2px #ffd27a; }
+  #sentence span.k1 { font-size: 0.7em; color: rgba(233, 196, 106, 0.35); }
+  #sentence span.k2 { font: 0.55em var(--mono); vertical-align: super; color: rgba(233, 196, 106, 0.45); }
+  #sentence span.k2.cur { color: #fff3d6; }
+  #pred { display: flex; gap: 18px; align-items: flex-end; min-height: 44px; font: 13px var(--mono); flex-wrap: wrap; justify-content: center; }
+  #pred .lbl { font: 10px var(--sans); letter-spacing: 0.25em; text-transform: uppercase; color: var(--gold-dim); align-self: center; }
+  #pred .p { display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 56px; }
+  #pred .p .t { color: var(--gold); white-space: pre; }
+  #pred .p .b { height: 3px; background: linear-gradient(90deg, #a8742a, #ffd27a); border-radius: 2px; }
+  #pred .p .v { font-size: 10px; color: #8d7550; }
+  #pred .p.hit .t { color: #fff3d6; text-shadow: 0 0 10px rgba(255, 200, 100, 0.8); }
+  #pred .p.hit .v::after { content: " \2713"; color: var(--gold-hi); }
+  #pred .actual { font-size: 11px; color: #8d7550; align-self: center; }
+  #pred .actual b { color: var(--gold); font-weight: 400; white-space: pre; }
+  #controls { left: 0; right: 0; bottom: 14px; display: flex; justify-content: center; gap: 8px; align-items: center; flex-wrap: wrap; padding: 0 16px; }
+  #controls button, #controls select, #controls label.btn { background: rgba(20, 15, 8, 0.75); color: var(--gold); border: 1px solid rgba(233, 196, 106, 0.28); border-radius: 6px; height: 30px; min-width: 30px; padding: 0 9px; font: 12px var(--sans); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; }
+  #controls button:hover, #controls label.btn:hover { border-color: rgba(233, 196, 106, 0.7); }
+  #controls button.on { background: rgba(233, 196, 106, 0.18); color: var(--gold-hi); }
+  #controls select { max-width: 260px; }
+  #controls .grp { display: inline-flex; gap: 3px; }
+  #controls .grp button { min-width: 26px; padding: 0 5px; font: 11px var(--mono); }
+  #controls input[type=range] { width: 90px; accent-color: #d9a441; }
+  #controls .spd { font: 11px var(--mono); color: #a48a5c; min-width: 52px; }
+  #controls input[type=file] { display: none; }
+  #credit { right: 24px; bottom: 18px; font: 10px var(--sans); letter-spacing: 0.2em; text-transform: uppercase; color: #6f5a36; display: none; }
+  #empty { inset: 0; display: none; align-items: center; justify-content: center; flex-direction: column; gap: 10px; text-align: center; font-size: 14px; color: #b49a6a; }
+  #empty code { font: 12px var(--mono); color: var(--gold-dim); }
+  body.nodata #empty { display: flex; }
+  body.cinema #controls, body.cinema #legend, body.cinema #readout .lrow .num, body.cinema #readout .hint { display: none; }
+  body.cinema #credit { display: block; }
+  body.bare .ui:not(#bottom), body.bare .vignette { display: none; }
+  body.bare #bottom { bottom: 36px; }
+  body.cinema #bottom { bottom: 44px; }
+  .hint { margin-top: 10px; font: 10px var(--sans); color: #6f5a36; letter-spacing: 0.05em; }
+  @media (max-width: 760px) {
+    #readout, #legend { display: none; }
+    #title .brand { font-size: 22px; }
+    #bottom { bottom: 104px; }
+  }
+</style>
+</head>
+<body class="nodata">
+<div id="stage"><canvas id="gl"></canvas><canvas id="ov"></canvas></div>
+<div class="vignette"></div>
+
+<div id="title" class="ui">
+  <div class="brand">AVA</div>
+  <div class="sub">a spiking language model, reading</div>
+  <div class="meta" id="meta"></div>
+</div>
+
+<div id="legend" class="ui">
+  <div><span class="dot" style="background:#ffad3a;box-shadow:0 0 8px #ffad3a"></span>LIF neuron spikes</div>
+  <div><span class="dot" style="background:#fff0c8;box-shadow:0 0 8px #fff0c8;width:7px;height:7px;margin:0 1.5px"></span>kWTA winners (MLP units; faint = won, passed nothing)</div>
+  <div><span class="dot" style="background:transparent;border:1px solid #e9c46a"></span>shell glow: memory write</div>
+  <div><span class="dot" style="background:linear-gradient(90deg,transparent,#ffe9b0);border-radius:2px;height:2px"></span>engram recall of earlier words</div>
+</div>
+
+<div id="readout" class="ui">
+  <h4>Live readout · this word</h4>
+  <div id="layers"></div>
+  <div id="engram"></div>
+  <div class="hint">spikes / units · memory write per layer · click a row to hide it</div>
+</div>
+
+<div id="bottom" class="ui">
+  <div id="sentence"></div>
+  <div id="pred"></div>
+</div>
+
+<div id="controls" class="ui">
+  <button id="bRestart" title="Restart (Home)">&#x23EE;</button>
+  <button id="bBack" title="Step back (&#8592;)">&#x25C0;</button>
+  <button id="bPlay" title="Play / pause (space)" style="min-width:44px">&#x25B6;</button>
+  <button id="bFwd" title="Step (&#8594;)">&#x25B6;&#xFE0E;|</button>
+  <input id="speed" type="range" min="0" max="100" value="38" title="Speed">
+  <span class="spd" id="spdLbl"></span>
+  <span class="grp" id="layerBtns"></span>
+  <select id="recSel" title="Recording"></select>
+  <label class="btn" title="Open a spike_record JSON">Open&#8230;<input id="file" type="file" accept=".json,application/json"></label>
+  <button id="bTrails" class="on" title="Motion trails (T)">Trails</button>
+  <button id="bSpin" class="on" title="Auto-rotate (S)">Spin</button>
+  <button id="bCinema" title="Cinema mode for recording a clip (C); B hides everything but the sentence">Cinema</button>
+</div>
+
+<div id="credit" class="ui">every flash is a recorded spike</div>
+<div id="empty" class="ui">
+  <div>No recording loaded.</div>
+  <div>Open a JSON made by <code>spike_record --out rec.json</code>, or drop it here.</div>
+</div>
+
+<script id="ava-data" type="application/json">null</script>
+<script>
+'use strict';
+// ------------------------------------------------------------------ state
+const MAXL = 16;
+const STAGGER = 0.055;       // phase offset between layers inside one token (layer 1 computes before layer 2 ...)
+function waveEnd() { return Math.min(1, 0.06 + STAGGER * ((geo ? geo.L : 8) - 1)); }
+let data = null, rec = null, recIdx = 0;
+let geo = null;              // point cloud
+let pos = 0, phase = 0, fired = [], playing = true, stepping = false, holdT = 0, clock = 0;
+let speed = 1.2;             // tokens per second
+let yaw = 0.6, pitch = 0.32, zoom = 1.0, spin = true, trails = true;
+let layerOn = new Array(MAXL).fill(1);
+const pulse = new Float32Array(MAXL);
+let arcs = [];               // engram reads of the current token: {j, w, born}
+let arcsPos = -1;
+
+const $ = (id) => document.getElementById(id);
+const stage = $('stage'), cgl = $('gl'), cov = $('ov');
+const ov = cov.getContext('2d');
+
+function mulberry32(a) {
+  return function () { a |= 0; a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+
+// ------------------------------------------------------------------ geometry: one shell per layer, inner = first
+function shellRadius(l, L) { return L <= 1 ? 1 : 0.32 + 0.68 * l / (L - 1); }
+
+function buildGeometry(L, spike, mlp) {
+  const per = spike + mlp, n = L * per;
+  const posA = new Float32Array(n * 3), info = new Float32Array(n * 2);
+  const ga = Math.PI * (3 - Math.sqrt(5));
+  for (let l = 0; l < L; l++) {
+    const rng = mulberry32(1013 + l * 7919);
+    const perm = Array.from({ length: per }, (_, i) => i);
+    for (let i = per - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); const t = perm[i]; perm[i] = perm[j]; perm[j] = t; }
+    const ay = rng() * Math.PI * 2, ax = (rng() - 0.5) * 1.2;
+    const cy = Math.cos(ay), sy = Math.sin(ay), cx = Math.cos(ax), sx = Math.sin(ax);
+    const R = shellRadius(l, L);
+    for (let u = 0; u < per; u++) {
+      const k = perm[u];
+      const y = 1 - 2 * (k + 0.5) / per, r = Math.sqrt(1 - y * y), th = k * ga;
+      let x = Math.cos(th) * r, z = Math.sin(th) * r, yy = y;
+      // fixed per-layer turn so the spirals of different shells do not line up
+      let x2 = cy * x + sy * z, z2 = -sy * x + cy * z;
+      let y3 = cx * yy - sx * z2, z3 = sx * yy + cx * z2;
+      const rr = R * (u < spike ? 0.985 : 1.0) * (1 + (rng() - 0.5) * 0.03);
+      const idx = l * per + u;
+      posA[idx * 3] = x2 * rr; posA[idx * 3 + 1] = y3 * rr; posA[idx * 3 + 2] = z3 * rr;
+      info[idx * 2] = l; info[idx * 2 + 1] = u < spike ? 0 : 1;
+    }
+  }
+  return { L, spike, mlp, per, n, pos: posA, info, heat: new Float32Array(n) };
+}
+
+// ------------------------------------------------------------------ WebGL renderer
+let gl = null, prog = null, quad = null, bufPos, bufInfo, bufHeat, U = {}, Q = {};
+const VS = `
+precision highp float;
+attribute vec3 aPos; attribute vec2 aInfo; attribute float aHeat;
+uniform mat3 uRot; uniform vec2 uScale; uniform float uOffY, uDist, uPx, uBase;
+uniform float uVis[16]; uniform float uPulse[16];
+varying vec3 vCol; varying float vHeat;
+void main() {
+  int L = int(aInfo.x + 0.5);
+  float vis = uVis[L];
+  vec3 p = uRot * aPos;
+  float persp = uDist / (uDist - p.z);
+  gl_Position = vec4(p.x * persp * uScale.x, p.y * persp * uScale.y + uOffY, 0.0, 1.0);
+  if (vis < 0.01) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 1.0; vCol = vec3(0.0); vHeat = 0.0; return; }
+  float near = clamp(0.5 + 0.5 * p.z, 0.0, 1.0);
+  float df = mix(0.25, 1.0, near);
+  float h = aHeat;
+  bool lif = aInfo.y < 0.5;
+  float ba = uBase * df * (lif ? 1.6 : 0.7) * (1.0 + 2.2 * uPulse[L]);
+  vec3 base = vec3(0.95, 0.6, 0.22);
+  vec3 hot = lif ? vec3(1.0, 0.6, 0.16) : vec3(1.0, 0.88, 0.62);
+  vCol = base * ba + hot * h * df * (lif ? 1.15 : 1.5);
+  vHeat = h;
+  gl_PointSize = max(1.0, (1.4 + h * (lif ? 15.0 : 6.5)) * uPx * persp);
+}`;
+const FS = `
+precision mediump float;
+varying vec3 vCol; varying float vHeat;
+void main() {
+  vec2 d = gl_PointCoord - vec2(0.5);
+  float r2 = dot(d, d) * 4.0;
+  if (r2 > 1.0) discard;
+  float a = exp(-r2 * 14.0) + 0.55 * exp(-r2 * 3.2) * (1.0 - r2);
+  gl_FragColor = vec4(vCol * a, 1.0);
+}`;
+const QVS = `attribute vec2 aQ; void main() { gl_Position = vec4(aQ, 0.0, 1.0); }`;
+const QFS = `precision mediump float; uniform float uFade; void main() { gl_FragColor = vec4(0.0, 0.0, 0.0, uFade); }`;
+
+function compile(src, type) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+function program(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(vs, gl.VERTEX_SHADER)); gl.attachShader(p, compile(fs, gl.FRAGMENT_SHADER)); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+function initGL() {
+  try {
+    gl = cgl.getContext('webgl', { antialias: false, alpha: false, preserveDrawingBuffer: true, premultipliedAlpha: false });
+    if (!gl) return false;
+    prog = program(VS, FS);
+    for (const k of ['uRot', 'uScale', 'uOffY', 'uDist', 'uPx', 'uBase', 'uVis', 'uPulse']) U[k] = gl.getUniformLocation(prog, k);
+    quad = program(QVS, QFS);
+    Q.uFade = gl.getUniformLocation(quad, 'uFade');
+    Q.buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, Q.buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    bufPos = gl.createBuffer(); bufInfo = gl.createBuffer(); bufHeat = gl.createBuffer();
+    gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    return true;
+  } catch (e) { console.warn('WebGL unavailable, using 2D', e); gl = null; return false; }
+}
+function uploadGeometry() {
+  if (!gl) return;
+  gl.bindBuffer(gl.ARRAY_BUFFER, bufPos); gl.bufferData(gl.ARRAY_BUFFER, geo.pos, gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, bufInfo); gl.bufferData(gl.ARRAY_BUFFER, geo.info, gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, bufHeat); gl.bufferData(gl.ARRAY_BUFFER, geo.heat, gl.DYNAMIC_DRAW);
+}
+
+// ------------------------------------------------------------------ camera
+let W = 1, H = 1, DPR = 1;
+const DIST = 3.4;
+function rotMat() {
+  const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+  // R = Rx(pitch) * Ry(yaw), rows
+  return [cy, 0, sy, sp * sy, cp, -sp * cy, -cp * sy, sp, cp * cy];
+}
+function view() {
+  const m = Math.min(W, H);
+  const k = 0.70 * zoom * m / H;
+  return { sx: k * H / W, sy: k, offY: H > W ? 0.12 : 0.1 };
+}
+function project(R, v, x, y, z) {
+  const px = R[0] * x + R[1] * y + R[2] * z, py = R[3] * x + R[4] * y + R[5] * z, pz = R[6] * x + R[7] * y + R[8] * z;
+  const persp = DIST / (DIST - pz);
+  return [W / 2 + px * persp * v.sx * W / 2, H / 2 - (py * persp * v.sy + v.offY) * H / 2, pz, persp];
+}
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = Math.floor(innerWidth * DPR); H = Math.floor(innerHeight * DPR);
+  cgl.width = cov.width = W; cgl.height = cov.height = H;
+  if (gl) { gl.viewport(0, 0, W, H); gl.clear(gl.COLOR_BUFFER_BIT); }
+}
+
+// ------------------------------------------------------------------ data
+function loadData(d) {
+  if (!d || !d.recordings || !d.recordings.length) { alert('Not a spike_record recording.'); return; }
+  data = d;
+  const L = d.model.layers, spike = d.units.spike, mlp = d.units.mlp;
+  if (L > MAXL) { alert('At most ' + MAXL + ' layers.'); return; }
+  geo = buildGeometry(L, spike, mlp);
+  uploadGeometry();
+  document.body.classList.remove('nodata');
+  const m = d.model;
+  $('meta').innerHTML = `${esc(m.name)} · model ${esc(m.kind)} · ${(m.params / 1e6).toFixed(1)}M weights<br>` +
+    `${L} layers × (${spike} LIF neurons + ${mlp} MLP units, k=${m.k})<br>` +
+    `${(L * (spike + mlp)).toLocaleString('en-US')} units drawn` + (m.engram != null ? ` · engram in layer ${m.engram + 1}` : '');
+  const sel = $('recSel'); sel.innerHTML = '';
+  d.recordings.forEach((r, i) => { const o = document.createElement('option'); o.value = i; o.textContent = r.text.length > 48 ? r.text.slice(0, 46) + '…' : r.text; sel.appendChild(o); });
+  sel.style.display = d.recordings.length > 1 ? '' : 'none';
+  buildLayerUI();
+  selectRecording(0);
+}
+function selectRecording(i) {
+  recIdx = i; rec = data.recordings[i]; $('recSel').value = i;
+  const s = $('sentence'); s.innerHTML = '';
+  rec.tokens.forEach((t, j) => {
+    const sp = document.createElement('span');
+    const kd = rec.kinds[j];
+    sp.textContent = kd === 1 ? (j === 0 ? '¶ ' : ' ¶ ') : kd === 2 ? t.replace(/[⟨⟩]/g, '').replace(' digits', 'd').replace(' digit', 'd') : t.replace(/\n/g, ' ⏎ ');
+    sp.className = 'k' + kd;
+    sp.title = kd === 2 ? 'glance length mark: ' + t : JSON.stringify(t);
+    sp.onclick = () => jump(j);
+    s.appendChild(sp);
+  });
+  restart();
+}
+function restart() { geo.heat.fill(0); pulse.fill(0); arcs = []; holdT = 0; startToken(0); playing = true; updatePlay(); }
+function jump(j) { geo.heat.fill(0); pulse.fill(0); arcs = []; startToken(j); if (!playing) stepping = true; }
+function startToken(p) {
+  pos = Math.max(0, Math.min(rec.steps.length - 1, p)); phase = 0; fired = new Array(geo.L).fill(false); holdT = 0;
+  const spans = $('sentence').children;
+  for (let j = 0; j < spans.length; j++) spans[j].classList.toggle('past', j < pos), spans[j].classList.toggle('cur', j === pos);
+  fireDue();
+}
+
+// one layer's recorded activity for the current token
+function fire(l) {
+  fired[l] = true;
+  const st = rec.steps[pos], la = st.L[l], base = l * geo.per, h = geo.heat;
+  for (const j of la.s) h[base + j] = 1;
+  const off = base + geo.spike;
+  for (let q = 0; q < la.w.length; q++) {
+    const a = la.a.charCodeAt(q) - 48;
+    const v = a <= 0 ? 0.12 : 0.3 + 0.7 * a / 9; // a winner whose ReLU passed nothing stays faint
+    const i = off + la.w[q];
+    if (h[i] < v) h[i] = v;
+  }
+  if (la.mw) { let s = 0; for (const x of la.mw) s += x; pulse[l] = Math.max(pulse[l], s / la.mw.length / 2); }
+  updateLayerRow(l, la);
+  if (data.model.engram === l && st.e) {
+    arcs = st.e.map(([j, w]) => ({ j, w, born: clock })); arcsPos = pos;
+    $('engram').innerHTML = `<h4>Engram recall · layer ${l + 1}</h4>` + (st.e.length ? st.e.map(([j, w]) => `<div class="rec"><span>${w.toFixed(2)}</span><b>${esc(tokLabel(j))}</b></div>`).join('') : '<div>(first word: nothing earlier)</div>');
+  }
+  if (l === geo.L - 1) showPred(st);
+}
+function fireDue() { for (let l = 0; l < geo.L; l++) if (!fired[l] && phase >= l * STAGGER) fire(l); }
+
+function showPred(st) {
+  const nextId = pos + 1 < rec.ids.length ? rec.ids[pos + 1] : null;
+  const max = st.p.length ? st.p[0][1] : 1;
+  let html = '<span class="lbl">next?</span>';
+  for (const [t, p, id] of st.p) {
+    const hit = id === nextId;
+    html += `<div class="p${hit ? ' hit' : ''}"><span class="t">${esc(predLabel(t, id))}</span><span class="b" style="width:${Math.max(4, 64 * p / max)}px"></span><span class="v">${(100 * p).toFixed(1)}%</span></div>`;
+  }
+  if (st.nx) html += `<span class="actual">came next: <b>${esc(tokLabel(pos + 1))}</b> · ${(100 * st.nx[0]).toFixed(1)}% · rank ${st.nx[1]}</span>`;
+  $('pred').innerHTML = html;
+}
+function tokLabel(j) { const k = rec.kinds[j], t = rec.tokens[j]; return k === 1 ? "¶ (start)" : k === 2 ? t : JSON.stringify(t); }
+function predLabel(t, id) { return id === 256 ? "¶ (end)" : id >= 4096 ? t : JSON.stringify(t); }
+function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+function buildLayerUI() {
+  const box = $('layers'); box.innerHTML = '';
+  const lb = $('layerBtns'); lb.innerHTML = '';
+  for (let l = 0; l < geo.L; l++) {
+    const row = document.createElement('div'); row.className = 'lrow'; row.id = 'lr' + l;
+    row.innerHTML = `<span class="${data.model.engram === l ? 'eng' : ''}">L${l + 1}</span><span class="bar"><i></i></span><span class="num">–</span><span class="bar mem"><i></i></span>`;
+    row.title = `layer ${l + 1}: LIF spikes (of ${geo.spike}) · memory write strength` + (data.model.engram === l ? ' · holds the engram' : '');
+    row.onclick = () => toggleLayer(l);
+    box.appendChild(row);
+    const b = document.createElement('button'); b.textContent = l + 1; b.className = 'on'; b.title = 'Show layer ' + (l + 1) + ' (key ' + (l + 1) + ')';
+    b.onclick = () => toggleLayer(l); lb.appendChild(b);
+  }
+}
+function toggleLayer(l) {
+  layerOn[l] = layerOn[l] ? 0 : 1;
+  $('lr' + l).classList.toggle('off', !layerOn[l]);
+  $('layerBtns').children[l].classList.toggle('on', !!layerOn[l]);
+}
+function updateLayerRow(l, la) {
+  const row = $('lr' + l); if (!row) return;
+  const bars = row.querySelectorAll('.bar i');
+  bars[0].style.width = (100 * Math.min(1, la.s.length / geo.spike * 3)).toFixed(1) + '%';
+  row.querySelector('.num').textContent = la.s.length;
+  if (la.mw) { let s = 0; for (const x of la.mw) s += x; bars[1].style.width = (100 * s / la.mw.length / 2).toFixed(1) + '%'; }
+}
+
+// ------------------------------------------------------------------ time
+function speedFromSlider(v) { return 0.2 * Math.pow(40, v / 100); } // 0.2 .. 8 tokens/s
+function updateSpeed() { speed = speedFromSlider(+$('speed').value); $('spdLbl').textContent = speed.toFixed(speed < 1 ? 2 : 1) + ' w/s'; }
+function updatePlay() { $('bPlay').innerHTML = playing ? '&#10073;&#10073;' : '&#x25B6;'; $('bPlay').classList.toggle('on', playing); }
+
+function advance(dt) {
+  if (!rec) return false;
+  const running = playing || stepping;
+  if (!running) return false;
+  clock += dt;
+  if (phase < 1) { phase = Math.min(1, phase + dt * speed); fireDue(); }
+  if (stepping && phase >= waveEnd()) { stepping = false; for (let l = 0; l < geo.L; l++) fire(l); } // paused: show the whole token at full strength
+  if (playing && phase >= 1) {
+    if (pos < rec.steps.length - 1) startToken(pos + 1);
+    else {
+      holdT += dt;
+      if (holdT > 2.4) {
+        if (data.recordings.length > 1) selectRecording((recIdx + 1) % data.recordings.length); else restart();
+      }
+    }
+  }
+  return true;
+}
+
+// ------------------------------------------------------------------ drawing
+function drawPointsGL(R, v) {
+  if (trails) {
+    gl.useProgram(quad); gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.uniform1f(Q.uFade, 0.42);
+    gl.bindBuffer(gl.ARRAY_BUFFER, Q.buf);
+    const qa = gl.getAttribLocation(quad, 'aQ'); gl.enableVertexAttribArray(qa); gl.vertexAttribPointer(qa, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); gl.disableVertexAttribArray(qa);
+  } else gl.clear(gl.COLOR_BUFFER_BIT);
+  if (!geo) return;
+  gl.useProgram(prog); gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  // column-major for GLSL
+  gl.uniformMatrix3fv(U.uRot, false, new Float32Array([R[0], R[3], R[6], R[1], R[4], R[7], R[2], R[5], R[8]]));
+  gl.uniform2f(U.uScale, v.sx, v.sy); gl.uniform1f(U.uOffY, v.offY); gl.uniform1f(U.uDist, DIST);
+  gl.uniform1f(U.uPx, DPR * Math.sqrt(Math.min(W, H) / DPR / 900) * zoom);
+  gl.uniform1f(U.uBase, (trails ? 0.42 : 1) * 0.085);
+  gl.uniform1fv(U.uVis, new Float32Array(layerOn));
+  gl.uniform1fv(U.uPulse, pulse);
+  const bind = (buf, name, size) => { const a = gl.getAttribLocation(prog, name); gl.bindBuffer(gl.ARRAY_BUFFER, buf); gl.enableVertexAttribArray(a); gl.vertexAttribPointer(a, size, gl.FLOAT, false, 0, 0); return a; };
+  const a1 = bind(bufPos, 'aPos', 3), a2 = bind(bufInfo, 'aInfo', 2);
+  gl.bindBuffer(gl.ARRAY_BUFFER, bufHeat); gl.bufferSubData(gl.ARRAY_BUFFER, 0, geo.heat);
+  const a3 = bind(bufHeat, 'aHeat', 1);
+  gl.drawArrays(gl.POINTS, 0, geo.n);
+  gl.disableVertexAttribArray(a1); gl.disableVertexAttribArray(a2); gl.disableVertexAttribArray(a3);
+}
+function drawPoints2D(R, v) {
+  ov.fillStyle = '#000'; ov.fillRect(0, 0, W, H);
+  if (!geo) return;
+  ov.globalCompositeOperation = 'lighter';
+  const P = geo.pos, I = geo.info, h = geo.heat, s = DPR;
+  for (let i = 0; i < geo.n; i++) {
+    const l = I[i * 2]; if (!layerOn[l]) continue;
+    const [x, y, z, pp] = project(R, v, P[i * 3], P[i * 3 + 1], P[i * 3 + 2]);
+    const df = 0.25 + 0.75 * Math.max(0, Math.min(1, 0.5 + 0.5 * z)), lif = I[i * 2 + 1] < 0.5, hh = h[i];
+    if (hh > 0.02) {
+      const r = (lif ? 6 : 3) * hh * s * pp + s;
+      ov.fillStyle = lif ? `rgba(255,160,50,${0.9 * hh * df})` : `rgba(255,232,180,${hh * df})`;
+      ov.fillRect(x - r, y - r, 2 * r, 2 * r);
+    } else {
+      ov.fillStyle = `rgba(240,160,60,${0.16 * df * (lif ? 1.5 : 0.7) * (1 + 2 * pulse[l])})`;
+      ov.fillRect(x, y, s, s);
+    }
+  }
+  ov.globalCompositeOperation = 'source-over';
+}
+
+function ringPoint(j, T) {
+  const span = Math.min(Math.PI * 1.75, 0.34 * Math.max(1, T - 1));
+  const th = -span / 2 + (T > 1 ? span * j / (T - 1) : 0) + Math.PI / 2;
+  const r = 1.2;
+  return [Math.cos(th) * r, 0, Math.sin(th) * r];
+}
+function drawOverlay(R, v) {
+  if (!rec || !geo) return;
+  const T = rec.steps.length;
+  ov.save(); ov.globalCompositeOperation = 'lighter';
+  // the engram store: every token read so far, on a ring around the sphere
+  ov.lineWidth = 1 * DPR; ov.strokeStyle = 'rgba(233,196,106,0.10)'; ov.beginPath();
+  for (let q = 0; q <= 96; q++) { const th = q / 96 * Math.PI * 2; const [x, y] = project(R, v, Math.cos(th) * 1.2, 0, Math.sin(th) * 1.2); q ? ov.lineTo(x, y) : ov.moveTo(x, y); }
+  ov.stroke();
+  const fontPx = Math.round(11 * DPR);
+  ov.font = `${fontPx}px ui-monospace, Consolas, monospace`; ov.textAlign = 'center';
+  const targets = new Set(arcsPos === pos ? arcs.map((a) => a.j) : []);
+  for (let j = 0; j <= pos; j++) {
+    const [x, y, z] = project(R, v, ...ringPoint(j, T));
+    const df = 0.35 + 0.65 * Math.max(0, Math.min(1, 0.5 + 0.5 * z / 1.2));
+    const cur = j === pos, tg = targets.has(j);
+    const r = (cur ? 4 : tg ? 3 : 1.8) * DPR;
+    const g = ov.createRadialGradient(x, y, 0, x, y, r * 4);
+    g.addColorStop(0, `rgba(255,236,190,${(cur ? 1 : tg ? 0.85 : 0.45) * df})`); g.addColorStop(1, 'rgba(255,200,100,0)');
+    ov.fillStyle = g; ov.beginPath(); ov.arc(x, y, r * 4, 0, Math.PI * 2); ov.fill();
+    if (cur || tg) {
+      ov.fillStyle = `rgba(255,232,180,${(cur ? 0.95 : 0.7) * df})`;
+      const t = rec.kinds[j] === 1 ? '¶' : rec.tokens[j].trim() || '␣';
+      ov.fillText(t.length > 14 ? t.slice(0, 13) + '…' : t, x, y - r * 2.4 - 2 * DPR);
+    }
+  }
+  // engram arcs: from the current token, dipping through the engram's shell, back to what it reads
+  if (arcsPos === pos && data.model.engram != null) {
+    const Re = shellRadius(data.model.engram, geo.L) * 0.55;
+    const a0 = ringPoint(pos, T);
+    for (const a of arcs) {
+      const age = clock - a.born, grow = Math.min(1, age / 0.35);
+      const fade = Math.exp(-Math.max(0, age - 0.35) * speed * 0.9);
+      const b0 = ringPoint(a.j, T);
+      const mid = [(a0[0] + b0[0]) / 2, 0, (a0[2] + b0[2]) / 2], ml = Math.hypot(mid[0], mid[2]) || 1;
+      const c = [mid[0] / ml * Re, 0.25, mid[2] / ml * Re];
+      const alpha = Math.min(1, 0.25 + 2.2 * a.w) * fade;
+      if (alpha < 0.01) continue;
+      ov.lineWidth = (0.8 + 6 * a.w) * DPR;
+      ov.strokeStyle = `rgba(255,226,160,${alpha})`;
+      ov.shadowColor = 'rgba(255,190,90,0.9)'; ov.shadowBlur = 10 * DPR;
+      ov.beginPath();
+      const N = 40, end = Math.max(1, Math.round(N * grow));
+      for (let q = 0; q <= end; q++) {
+        const t = q / N, u = 1 - t;
+        const p = [u * u * a0[0] + 2 * u * t * c[0] + t * t * b0[0], u * u * a0[1] + 2 * u * t * c[1] + t * t * b0[1], u * u * a0[2] + 2 * u * t * c[2] + t * t * b0[2]];
+        const [x, y] = project(R, v, p[0], p[1], p[2]);
+        q ? ov.lineTo(x, y) : ov.moveTo(x, y);
+      }
+      ov.stroke();
+    }
+  }
+  ov.restore();
+}
+
+let last = performance.now(), fpsAcc = 0, fpsN = 0;
+function frame(now) {
+  const dt = Math.min(0.1, (now - last) / 1000); last = now;
+  if (spin && !dragging) yaw += dt * 0.12;
+  const running = advance(dt);
+  if (running && geo) {
+    const tau = Math.max(0.08, 0.38 / speed);
+    const f = Math.exp(-dt / tau), h = geo.heat;
+    for (let i = 0; i < h.length; i++) h[i] *= f;
+    const fp = Math.exp(-dt / (tau * 1.6));
+    for (let l = 0; l < MAXL; l++) pulse[l] *= fp;
+  }
+  const R = rotMat(), v = view();
+  if (gl) { drawPointsGL(R, v); ov.clearRect(0, 0, W, H); } else drawPoints2D(R, v);
+  drawOverlay(R, v);
+  fpsAcc += dt; fpsN++;
+  if (fpsAcc > 1) { window.__fps = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0; }
+  requestAnimationFrame(frame);
+}
+
+// ------------------------------------------------------------------ input
+let dragging = false, lx = 0, ly = 0;
+stage.addEventListener('pointerdown', (e) => { dragging = true; lx = e.clientX; ly = e.clientY; stage.classList.add('drag'); stage.setPointerCapture(e.pointerId); });
+stage.addEventListener('pointermove', (e) => {
+  if (!dragging) return;
+  yaw += (e.clientX - lx) * 0.006; pitch = Math.max(-1.3, Math.min(1.3, pitch + (e.clientY - ly) * 0.006));
+  lx = e.clientX; ly = e.clientY;
+});
+const endDrag = () => { dragging = false; stage.classList.remove('drag'); };
+stage.addEventListener('pointerup', endDrag); stage.addEventListener('pointercancel', endDrag);
+stage.addEventListener('wheel', (e) => { e.preventDefault(); zoom = Math.max(0.5, Math.min(2.2, zoom * Math.exp(-e.deltaY * 0.001))); }, { passive: false });
+
+function togglePlay() { if (!rec) return; playing = !playing; stepping = false; updatePlay(); }
+function stepBy(dq) { if (!rec) return; playing = false; updatePlay(); jump(pos + dq); }
+$('bPlay').onclick = togglePlay;
+$('bFwd').onclick = () => stepBy(1);
+$('bBack').onclick = () => stepBy(-1);
+$('bRestart').onclick = () => rec && restart();
+$('speed').oninput = updateSpeed;
+$('recSel').onchange = (e) => selectRecording(+e.target.value);
+$('bTrails').onclick = () => { trails = !trails; $('bTrails').classList.toggle('on', trails); if (gl) gl.clear(gl.COLOR_BUFFER_BIT); };
+$('bSpin').onclick = () => { spin = !spin; $('bSpin').classList.toggle('on', spin); };
+$('bCinema').onclick = () => { document.body.classList.toggle('cinema'); $('bCinema').classList.toggle('on'); };
+$('file').onchange = (e) => { const f = e.target.files[0]; if (f) readFile(f); };
+function readFile(f) { const r = new FileReader(); r.onload = () => { try { loadData(JSON.parse(r.result)); } catch (err) { alert('Could not read ' + f.name + ': ' + err.message); } }; r.readAsText(f); }
+window.addEventListener('dragover', (e) => e.preventDefault());
+window.addEventListener('drop', (e) => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) readFile(f); });
+window.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT') return;
+  const k = e.key;
+  if (k === ' ') { e.preventDefault(); togglePlay(); }
+  else if (k === 'ArrowRight') stepBy(1);
+  else if (k === 'ArrowLeft') stepBy(-1);
+  else if (k === 'Home') rec && restart();
+  else if (k === 'c' || k === 'C') $('bCinema').onclick();
+  else if (k === 'b' || k === 'B') document.body.classList.toggle('bare');
+  else if (k === 't' || k === 'T') $('bTrails').onclick();
+  else if (k === 's' || k === 'S') $('bSpin').onclick();
+  else if (k === 'r' || k === 'R') { yaw = 0.6; pitch = 0.32; zoom = 1; }
+  else if (/^[1-9]$/.test(k) && geo && +k <= geo.L) toggleLayer(+k - 1);
+});
+window.addEventListener('resize', resize);
+
+// ------------------------------------------------------------------ start
+initGL();
+resize();
+updateSpeed();
+geo = buildGeometry(8, 384, 1536);   // an idle (dark) sphere until a recording loads: no flashes without data
+uploadGeometry();
+try {
+  const txt = $('ava-data').textContent.trim();
+  if (txt && txt !== 'null') loadData(JSON.parse(txt));
+} catch (e) { console.error('embedded recording unreadable', e); }
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

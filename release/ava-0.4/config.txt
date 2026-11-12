@@ -1,0 +1,50 @@
+model=D
+d=384
+layers=8
+vocab=4112
+weights=26840893
+arch=see arch.txt (her block options; the tools read it beside model.safetensors)
+tokenizer=bpe.txt (sha256 b1ccf0b9..., the same file as Ava 0.3's)
+start=v42 s5-v42 (387080192 tokens of the v42 mix; val_bpb=1.316986 on the v42-mix val; sha256 0aa12211...)
+
+[grow]
+init=v42 s5-v42
+train=data/nn/shards-v41-mix (the v41 mix: usual text 70%, 337 PG-19 training books 25%, number practice 5%)
+tokens=108134400
+ctx=2048
+batch=4
+long_ctx=8192
+long_from=0.75
+recall_every=2
+recall_rows=1
+steps=13200
+qa=42140 question-answer pairs (data/v41/teach.sft: SciQ, Dolly 15k, ARC, OpenBookQA training splits; dev and test stems removed)
+qa_batch_tokens=4096
+qa_epochs=2
+qa_weight=1.0
+lr=3e-4
+warmup=200
+min_lr_frac=0.1
+wd=0.1
+clip=1.0
+data_seed=41
+magnitude_code=1
+engram_block=4
+homeostasis_nudge=on (v52 kept the homeostasis nudge)
+v52_flags=--lif-reset-grad --letters --mood --neuromod 3 --stp --cerebellum-head 12288 --dendrite --dopamine --rhythm --thalamus (parts: R M N S CB P DA Y TH Hn)
+train_seconds=6790.94
+tokens_per_sec=17426.2
+val_bpb=1.493120
+
+[teach]
+round1=the v43 answer lessons (data/v43/teach.sft); 17187 examples, 3 epochs, lr 3e-4, data_seed 43, 14745600 reading tokens; 983.89 s; val_bpb=1.535728
+round2=lessons from round 1's own practice answers (v43_prep seed 2: SciQ, SQuAD 2.0, her practice questions, drills); 19554 examples, 2 epochs, lr 2e-4, data_seed 44, 16220160 reading tokens; 1046.41 s; val_bpb=1.521021
+round3=lessons from round 1's own practice answers (v43_prep seed 3, with harder drills); 16005 examples, 2 epochs, lr 1.5e-4, data_seed 45, 13189120 reading tokens; 846.65 s; val_bpb=1.513273
+homeostasis_nudge=on (v52 kept the homeostasis nudge)
+shipped=round 3 (C3, the best of three on the 100 dev questions by right - wrong)
+
+[eval]
+eval_ctx=256
+eval_tokens=1000000
+val=v41-mix val (data/nn/shards-v41-mix/val)
+val_bpb=1.513273

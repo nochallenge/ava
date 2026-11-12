@@ -1,0 +1,1 @@
+--head-size 64 --timescales fixed --gates channel --value-residual --kwta 1/4 --mlp-act relu2 --mem-momentum 0.5 --resid-fix --residual dense --lif-init logspaced --lif-scale --spikes int2 --alif --lif-reset-grad --homeostasis 0.1 --stp --neuromod 3 --dendrite --letters --dopamine --mood --rhythm --thalamus --cerebellum-head 12288

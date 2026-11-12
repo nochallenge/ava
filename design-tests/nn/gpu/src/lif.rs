@@ -14,7 +14,13 @@ const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/lif.ptx"));
 
 /// Spikes of the LIF scan over the time axis of `cur` [B, T, D] with leak `beta` [D] (already in (0,1)).
 pub fn lif(cur: &Tensor, beta: &Tensor) -> Result<Tensor> {
-    cur.contiguous()?.apply_op2(&beta.contiguous()?, LifScan)
+    cur.contiguous()?.apply_op2(&beta.contiguous()?, LifScan { slope: LIF_SLOPE as f32 })
+}
+
+/// v42 (R3, --surrogate-slope): `lif` with the surrogate slope S given, ds/dv = 1 / (1 + S·|v - theta|)^2. The kernels
+/// already took the slope as an argument, so lif.cu is unchanged; `lif` is this with S = LIF_SLOPE, the same bits.
+pub fn lif_slope(cur: &Tensor, beta: &Tensor, slope: f32) -> Result<Tensor> {
+    cur.contiguous()?.apply_op2(&beta.contiguous()?, LifScan { slope })
 }
 
 fn dims(l1: &Layout, l2: &Layout) -> Result<(usize, usize, usize)> {
@@ -33,7 +39,10 @@ fn cpu_slice<'a>(s: &'a CpuStorage, l: &Layout) -> Result<&'a [f32]> {
     }
 }
 
-struct LifScan;
+/// The scan; `slope` only matters to its backward (LifScanBwd).
+struct LifScan {
+    slope: f32,
+}
 
 impl CustomOp2 for LifScan {
     fn name(&self) -> &'static str {
@@ -84,7 +93,7 @@ impl CustomOp2 for LifScan {
 
     fn bwd(&self, cur: &Tensor, beta: &Tensor, _s: &Tensor, grad_s: &Tensor) -> Result<(Option<Tensor>, Option<Tensor>)> {
         let (b, t, d) = cur.dims3()?;
-        let packed = cur.detach().apply_op3_no_bwd(&beta.detach(), &grad_s.detach().contiguous()?, &LifScanBwd)?;
+        let packed = cur.detach().apply_op3_no_bwd(&beta.detach(), &grad_s.detach().contiguous()?, &LifScanBwd { slope: self.slope })?;
         let g_cur = packed.narrow(1, 0, t)?;
         let g_beta = packed.narrow(1, t, 1)?.reshape((b, d))?.sum(0)?;
         Ok((Some(g_cur), Some(g_beta)))
@@ -92,7 +101,9 @@ impl CustomOp2 for LifScan {
 }
 
 /// (cur, beta, grad of spikes) -> [B, T+1, D]: dL/dI in rows 0..T, per-batch-row dL/dbeta in row T.
-struct LifScanBwd;
+struct LifScanBwd {
+    slope: f32,
+}
 
 impl CustomOp3 for LifScanBwd {
     fn name(&self) -> &'static str {
@@ -110,7 +121,7 @@ impl CustomOp3 for LifScanBwd {
     ) -> Result<(CpuStorage, Shape)> {
         let (b, t, d) = dims(l1, l2)?;
         let (cur, beta, gs) = (cpu_slice(s1, l1)?, cpu_slice(s2, l2)?, cpu_slice(s3, l3)?);
-        let (theta, slope) = (LIF_THRESHOLD as f32, LIF_SLOPE as f32);
+        let (theta, slope) = (LIF_THRESHOLD as f32, self.slope);
         let mut out = vec![0f32; b * (t + 1) * d];
         let mut v_hist = vec![0f32; t];
         for bi in 0..b {
@@ -155,7 +166,7 @@ impl CustomOp3 for LifScanBwd {
         let out = unsafe { dev.alloc::<f32>(b * (t + 1) * d)? };
         let func = dev.get_or_load_custom_func("lif_bwd", "ava_lif", PTX)?;
         let (bi, ti, di) = (b as i32, t as i32, d as i32);
-        let (theta, slope) = (LIF_THRESHOLD as f32, LIF_SLOPE as f32);
+        let (theta, slope) = (LIF_THRESHOLD as f32, self.slope);
         let mut lb = func.builder();
         lb.arg(&cur).arg(&beta).arg(&gs).arg(&out).arg(&bi).arg(&ti).arg(&di).arg(&theta).arg(&slope);
         unsafe { lb.launch(launch_cfg(b * d)) }.w()?;
@@ -163,7 +174,7 @@ impl CustomOp3 for LifScanBwd {
     }
 }
 
-fn cuda_slice<'a>(
+pub(crate) fn cuda_slice<'a>(
     s: &'a candle_core::CudaStorage,
     l: &Layout,
 ) -> Result<candle_core::cuda_backend::cudarc::driver::CudaView<'a, f32>> {
@@ -174,7 +185,7 @@ fn cuda_slice<'a>(
     }
 }
 
-fn launch_cfg(threads: usize) -> candle_core::cuda_backend::cudarc::driver::LaunchConfig {
+pub(crate) fn launch_cfg(threads: usize) -> candle_core::cuda_backend::cudarc::driver::LaunchConfig {
     const BLOCK: u32 = 128;
     candle_core::cuda_backend::cudarc::driver::LaunchConfig {
         grid_dim: ((threads as u32).div_ceil(BLOCK), 1, 1),
@@ -183,9 +194,44 @@ fn launch_cfg(threads: usize) -> candle_core::cuda_backend::cudarc::driver::Laun
     }
 }
 
+/// v51 cbfix (runs/v51/cbfix.md): the device's shared memory per block in bytes, (by default, with the opt-in):
+/// CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK and .._OPTIN (the opt-in never below the default).
+pub fn smem_limits(dev: &candle_core::CudaDevice) -> Result<(usize, usize)> {
+    use candle_core::cuda_backend::cudarc::driver::sys::CUdevice_attribute as A;
+    use candle_core::cuda_backend::WrapErr;
+    let st = dev.cuda_stream();
+    let ctx = st.context();
+    let base = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK).w()?.max(0) as usize;
+    let optin = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN).w()?.max(0) as usize;
+    Ok((base, optin.max(base)))
+}
+
+/// v51 cbfix: readies `func` (kernel `name`) for a launch with `dyn_bytes` of dynamic shared memory. A block holds the
+/// kernel's static shared memory plus the dynamic bytes: up to the default per block (48 KB) as is; past it only once
+/// the function's MAX_DYNAMIC_SHARED_SIZE_BYTES is raised (set here to `dyn_bytes`), and never past the device's opt-in
+/// limit (an error naming the sizes then, where the driver says only "invalid argument").
+pub(crate) fn smem_ready(dev: &candle_core::CudaDevice, func: &candle_core::cuda_backend::cudarc::driver::CudaFunction, name: &str, dyn_bytes: usize) -> Result<()> {
+    use candle_core::cuda_backend::cudarc::driver::sys::CUfunction_attribute_enum as Attr;
+    use candle_core::cuda_backend::WrapErr;
+    if dyn_bytes == 0 {
+        return Ok(());
+    }
+    let stat = func.shared_size_bytes().w()?.max(0) as usize;
+    let (base, optin) = smem_limits(dev)?;
+    if stat + dyn_bytes <= base {
+        return Ok(());
+    }
+    if stat + dyn_bytes > optin {
+        candle_core::bail!("{name}: {dyn_bytes} B of shared memory + its own {stat} B exceed the device's {optin} B per block (opt-in)");
+    }
+    func.set_attribute(Attr::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, dyn_bytes as i32).w()?;
+    Ok(())
+}
+
 /// 0/1 kWTA mask of `u` [N, H] (no gradient): 1 where u >= the k-th largest value of its row. One CUDA
 /// block per row finds that value by radix select (`kwta_mask_rows` in lif.cu), instead of sorting every
-/// row; the mask is the same as model::kwta_mask_sorted gives.
+/// row; the mask is the same as model::kwta_mask_sorted gives. v51 cbfix: a row's keys (4 H bytes) plus the kernel's
+/// own 1 KB past 48 KB take the opt-in (H up to 25086 on a 99 KB card); a wider row is an error, not a crash.
 pub fn kwta_mask_fast(u: &Tensor, k: usize) -> Result<Tensor> {
     u.detach().contiguous()?.apply_op1_no_bwd(&KwtaMask { k })
 }
@@ -221,13 +267,13 @@ impl candle_core::CustomOp1 for KwtaMask {
         use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
         use candle_core::cuda_backend::WrapErr;
         let (n, h) = l.shape().dims2()?;
-        if h > 12288 {
-            candle_core::bail!("kwta-mask: rows of {h} exceed the shared-memory limit");
-        }
         let dev = s.device().clone();
+        let func = dev.get_or_load_custom_func("kwta_mask_rows", "ava_lif", PTX)?;
+        // v51 cbfix: was `h > 12288` refused and nothing else, but 4 h + the kernel's static 1032 B past 48 KB needs the
+        // opt-in, so rows of 12031..12288 (CB's G 12288 at d384) failed at launch with "invalid argument"
+        smem_ready(&dev, &func, "kwta-mask", h * 4)?;
         let u = cuda_slice(s, l)?;
         let out = unsafe { dev.alloc::<f32>(n * h)? };
-        let func = dev.get_or_load_custom_func("kwta_mask_rows", "ava_lif", PTX)?;
         let (ni, hi, ki) = (n as i32, h as i32, self.k.min(h) as i32);
         let mut lb = func.builder();
         lb.arg(&u).arg(&out).arg(&ni).arg(&hi).arg(&ki);
@@ -244,6 +290,18 @@ impl candle_core::CustomOp1 for KwtaMask {
 pub fn cross_entropy_fused(logits: &Tensor, targets: &Tensor) -> Result<Tensor> {
     let out = logits.contiguous()?.apply_op2(&targets.contiguous()?, CeFwd)?; // [N, 2] = (loss, lse)
     out.narrow(1, 0, 1)?.mean_all()
+}
+
+/// v42: the fused cross-entropy per row, [N] (with autograd: each row's gradient is scaled by the gradient its loss
+/// gets, so a weighted sum of the rows is exact). A target >= V gives 0 and no gradient.
+pub fn cross_entropy_rows(logits: &Tensor, targets: &Tensor) -> Result<Tensor> {
+    if logits.dtype() != candle_core::DType::F32 {
+        // v51 fast1 (F-1's f64 reference on the CPU): the same rows by candle's ops (every target < V)
+        let lsm = candle_nn::ops::log_softmax(logits, candle_core::D::Minus1)?;
+        return lsm.gather(&targets.to_dtype(candle_core::DType::U32)?.unsqueeze(1)?, 1)?.squeeze(1)?.neg();
+    }
+    let out = logits.contiguous()?.apply_op2(&targets.contiguous()?, CeFwd)?; // [N, 2] = (loss, lse)
+    out.narrow(1, 0, 1)?.squeeze(1)
 }
 
 fn u32_cpu<'a>(s: &'a CpuStorage, l: &Layout) -> Result<&'a [u32]> {
@@ -366,13 +424,13 @@ impl CustomOp3 for CeBwd {
 
 /// Spikes of the fused LIF scan, untracked. `beta` is the leak in (0, 1) (already through the sigmoid).
 pub fn lif_fwd_raw(cur: &Tensor, beta: &Tensor) -> Result<Tensor> {
-    cur.contiguous()?.apply_op2_no_bwd(&beta.contiguous()?, &LifScan)
+    cur.contiguous()?.apply_op2_no_bwd(&beta.contiguous()?, &LifScan { slope: LIF_SLOPE as f32 })
 }
 
 /// (dL/dcur [B, T, D], dL/dbeta [D]) of the fused LIF scan for the spike gradient `grad_s`.
 pub fn lif_bwd_raw(cur: &Tensor, beta: &Tensor, grad_s: &Tensor) -> Result<(Tensor, Tensor)> {
     let (b, t, d) = cur.dims3()?;
-    let packed = cur.contiguous()?.apply_op3_no_bwd(&beta.contiguous()?, &grad_s.contiguous()?, &LifScanBwd)?;
+    let packed = cur.contiguous()?.apply_op3_no_bwd(&beta.contiguous()?, &grad_s.contiguous()?, &LifScanBwd { slope: LIF_SLOPE as f32 })?;
     Ok((packed.narrow(1, 0, t)?, packed.narrow(1, t, 1)?.reshape((b, d))?.sum(0)?))
 }
 

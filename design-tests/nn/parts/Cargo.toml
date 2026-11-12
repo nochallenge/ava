@@ -1,0 +1,14 @@
+# TESTING / DESIGN ONLY: Wave 5 brain parts for Ava, built and tested on the CPU on their own. Each part is
+# plain candle ops with the gpu crate's conventions (weights [d_in, d_out] applied as h · W), and every new
+# weight starts so that the part changes nothing, so it can later be switched on in the model by a flag.
+[package]
+name = "ava_parts"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+
+# Detached from any parent workspace, like the other nn crates.
+[workspace]
