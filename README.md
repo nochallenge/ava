@@ -25,6 +25,10 @@ She is a **tiny research model**. She does not rival any modern assistant and wi
 nonsense. What she offers is a different design, built so that every part of it can be scaled, and a
 method: every number below comes from a test that was written down before it ran.
 
+![Ava 0.4 in her chat app: a 3D brain behind the conversation](docs/ava-0.4-chat.webp)
+
+*Ava 0.4 in her chat app. The brain behind the chat lights up from her real activity as she reads and answers.*
+
 **A note from her creator (November 2026).** Ava's development is coming to an end for now. She needs
 more GPUs than I have: my single RTX 4070 cannot handle the scale she needs in order to grow. If you
 want to use Ava, or would like me to keep working on her and you have GPU time available, I would be
